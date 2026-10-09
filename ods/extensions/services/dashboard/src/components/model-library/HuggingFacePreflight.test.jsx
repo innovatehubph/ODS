@@ -170,3 +170,48 @@ test('the context label names where the number came from', async () => {
   expect(dialog.getByText('GGUF metadata')).toBeVisible()
   expect(dialog.queryByText('This file’s GGUF header')).toBeNull()
 })
+
+test('a mixed repository scopes checked-file evidence and refusal to its artifact', async () => {
+  const refusal = {code: 'not_a_chat_model:reranker', message: 'This is a reranking model.', overridable: false}
+  preflightBody = preflight({
+    artifactId: 'q4',
+    modelKind: 'reranker',
+    refusal,
+    artifacts: {
+      q4: {...okCheck, refusal},
+      q8: {
+        fit: {...okCheck.fit, estimate: 'rough'}, disk: 'ok', refusal: null,
+        header: {status: 'unavailable', file: 'model-Q8_0.gguf', reason: 'not_read'},
+      },
+    },
+  })
+  const dialog = await open()
+  expect(dialog.getByRole('region', {name: 'Before you download'})).toHaveTextContent('Checks for model-Q4_K_M.gguf.')
+  expect(dialog.getByText('Checked artifact context')).toBeVisible()
+  expect(dialog.getByRole('button', {name: 'Not supported'})).toBeDisabled()
+  expect(dialog.getByText('This artifact’s header has not been checked.')).toBeVisible()
+  expect(dialog.getByText('Fits at 64K tokens (rough estimate)')).toBeVisible()
+  await act(async () => { fireEvent.click(dialog.getByRole('button', {name: 'Import', exact: true})) })
+  expect(importBodies()).toEqual([{repoId: 'org/model', artifactId: 'q8'}])
+  expect(fetch.mock.calls.filter(([url]) => url.includes('/preflight/'))).toHaveLength(1)
+})
+
+test('artifact-bound unknown context does not fall back to an unrelated Hub value', async () => {
+  detailsBody = {...repo, artifacts, contextLength: 131072, contextSource: 'gguf_metadata'}
+  preflightBody = preflight({artifactId: 'q4', contextLength: null, contextSource: 'unavailable'})
+  const dialog = await open()
+  expect(dialog.getByText('Checked artifact context')).toBeVisible()
+  expect(dialog.queryByText('128K tokens')).toBeNull()
+})
+
+test('repository access refusal still applies to all artifact rows', async () => {
+  const refusal = {code: 'gated', message: 'This model is gated on Hugging Face. Accept its license.', overridable: false}
+  preflightBody = preflight({
+    artifactId: 'q4', refusal,
+    artifacts: {q4: {...okCheck, refusal}, q8: {...okCheck, refusal}},
+  })
+  const dialog = await open()
+  expect(dialog.getAllByRole('button', {name: 'Needs access'})).toHaveLength(2)
+  for (const button of dialog.getAllByRole('button', {name: 'Needs access'})) expect(button).toBeDisabled()
+  expect(dialog.getAllByRole('alert')).toHaveLength(1)
+})

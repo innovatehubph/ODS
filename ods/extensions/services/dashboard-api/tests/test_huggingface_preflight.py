@@ -92,6 +92,7 @@ def preflight_env(monkeypatch, tmp_path):
     state = {"details": _details(), "header": _dense_header(), "storage": {
         "freeBytes": 20 * GIB, "totalBytes": 100 * GIB, "marginBytes": 5 * GIB}}
     reads = []
+    cached_reads = []
 
     async def fake_details(repo_id):
         assert repo_id == REPO
@@ -99,24 +100,29 @@ def preflight_env(monkeypatch, tmp_path):
 
     async def fake_header(repo_id, revision, filename, *, expected_size=None, token="", client=None):
         reads.append((repo_id, revision, filename, expected_size))
-        if isinstance(state["header"], Exception):
-            raise state["header"]
-        return state["header"]
+        header = state.get("headers", {}).get(filename, state["header"])
+        if isinstance(header, Exception):
+            raise header
+        return header
 
     async def fake_storage():
         return state["storage"]
 
     def fake_cached(repo_id, revision, filename):
         # What the preflight read earlier in this process (the import never reads).
+        cached_reads.append((repo_id, revision, filename))
+        if "cached_headers" in state:
+            return state["cached_headers"].get(filename)
         if not state.get("cached", True) or isinstance(state["header"], Exception):
             return None
-        return state["header"]
+        return state["header"] if filename == "model-Q4_K_M.gguf" else None
 
     monkeypatch.setattr(models_router, "_hf_repo_details", fake_details)
     monkeypatch.setattr(hf_gguf_header, "fetch_gguf_header", fake_header)
     monkeypatch.setattr(hf_gguf_header, "cached_gguf_header", fake_cached)
     monkeypatch.setattr(models_router, "_model_storage_status", fake_storage)
     state["reads"] = reads
+    state["cached_reads"] = cached_reads
     return models_router, state
 
 
@@ -131,7 +137,7 @@ def test_preflight_reports_header_runtime_fit_template_and_disk(test_client, pre
 
     assert response.status_code == 200
     body = response.json()
-    # One header read for the repository, from its smallest artifact.
+    # One network header read, scoped to its artifact rather than the repository.
     assert state["reads"] == [(REPO, "c" * 40, "model-Q4_K_M.gguf", 4 * GIB)]
     assert body["header"] == {"status": "read", "file": "model-Q4_K_M.gguf", "bytesRead": 2_000_000}
     assert body["architecture"] == "llama"
@@ -140,10 +146,16 @@ def test_preflight_reports_header_runtime_fit_template_and_disk(test_client, pre
     assert body["contextLength"] == 131072
     assert body["template"] == {"present": True, "tools": True, "thinking": "toggle"}
     assert body["refusal"] is None
+    assert body["artifactId"] == "a" * 20
     small, large = body["artifacts"]["a" * 20], body["artifacts"]["b" * 20]
     assert small["fit"]["estimate"] == "architecture"
     assert small["fit"]["status"] in {"fits", "fits_short_context"}
     assert large["fit"]["status"] == "too_large"
+    assert large["fit"]["estimate"] == "rough"
+    assert large["architecture"] is None
+    assert large["template"] == {"present": None, "tools": None, "thinking": "unknown"}
+    assert large["contextLength"] is None
+    assert large["contextSource"] == "unavailable"
     assert small["disk"] == "ok"
     assert large["disk"] == "insufficient"
 
@@ -176,7 +188,7 @@ def test_preflight_names_a_reranker_from_its_header(test_client, preflight_env):
     assert body["runtime"]["architectureSupported"] is None
 
 
-def test_preflight_without_a_header_uses_the_hub_hint(test_client, preflight_env):
+def test_preflight_without_a_header_cannot_bind_a_multi_artifact_hub_hint(test_client, preflight_env):
     _router, state = preflight_env
     state["header"] = hf_gguf_header.HeaderUnavailable("rate_limited", "Hugging Face rate limit reached")
     state["storage"] = None
@@ -185,8 +197,8 @@ def test_preflight_without_a_header_uses_the_hub_hint(test_client, preflight_env
 
     assert body["header"]["status"] == "unavailable"
     assert body["header"]["reason"] == "rate_limited"
-    assert body["architecture"] == "llama"
-    assert body["runtime"]["architectureSupported"] is True
+    assert body["architecture"] is None
+    assert body["runtime"]["architectureSupported"] is None
     assert body["template"] == {"present": None, "tools": None, "thinking": "unknown"}
     assert body["artifacts"]["a" * 20]["fit"]["estimate"] == "rough"
     assert body["artifacts"]["a" * 20]["disk"] == "unknown"
@@ -200,8 +212,8 @@ def test_preflight_reports_where_the_context_came_from(test_client, preflight_en
 
     state["header"] = hf_gguf_header.HeaderUnavailable("rate_limited", "Hugging Face rate limit reached")
     body = _preflight(test_client).json()
-    assert body["contextLength"] == 8192
-    assert body["contextSource"] == "hub_config"
+    assert body["contextLength"] is None
+    assert body["contextSource"] == "unavailable"
 
 
 _GATED = hf_gguf_header.HeaderUnavailable("gated", "This repository is gated")
@@ -225,6 +237,7 @@ def test_preflight_refuses_a_gated_repository_this_host_cannot_download(
     assert body["refusal"]["overridable"] is False
     assert "accept its license" in body["refusal"]["message"]
     assert "HF_TOKEN in Settings" in body["refusal"]["message"]
+    assert all(row["refusal"]["code"] == "gated" for row in body["artifacts"].values())
 
 
 def test_preflight_allows_a_gated_repository_the_token_can_read(test_client, preflight_env, monkeypatch):
@@ -352,6 +365,7 @@ def test_import_without_a_cached_header_gates_on_the_hub_summary(test_client, pr
     monkeypatch.setattr(models_router, "GPU_BACKEND", "amd")
     state["cached"] = False
     state["details"] = _details(ggufArchitecture="nanbeige")
+    state["details"]["artifacts"] = state["details"]["artifacts"][:1]
     monkeypatch.setattr(models_router, "_call_agent_model", lambda *_a, **_k: pytest.fail("not dispatched"))
 
     response = _import(test_client)
@@ -359,6 +373,113 @@ def test_import_without_a_cached_header_gates_on_the_hub_summary(test_client, pr
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "runtime_architecture_unsupported"
     assert state["reads"] == []
+
+
+def test_selected_artifact_preflight_reads_only_its_own_header(test_client, preflight_env):
+    _router, state = preflight_env
+    other = _dense_header("qwen3", {"tokenizer.chat_template": "plain prompt"})
+    other.update(context_length=4096, block_count=24, attention_head_count_kv=4)
+    state["headers"] = {"model-Q8_0.gguf": other}
+
+    response = test_client.get(
+        f"/api/models/huggingface/preflight/{REPO}?artifactId={'b' * 20}",
+        headers=test_client.auth_headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert state["reads"] == [(REPO, "c" * 40, "model-Q8_0.gguf", 30 * GIB)]
+    assert body["artifactId"] == "b" * 20
+    assert body["architecture"] == body["artifacts"]["b" * 20]["architecture"] == "qwen3"
+    assert body["contextLength"] == 4096
+    assert body["template"]["tools"] is False
+    assert body["artifacts"]["a" * 20]["architecture"] == "llama"
+
+
+def test_unknown_artifact_preflight_does_not_read_a_different_file(test_client, preflight_env):
+    _router, state = preflight_env
+    response = test_client.get(
+        f"/api/models/huggingface/preflight/{REPO}?artifactId={'f' * 20}",
+        headers=test_client.auth_headers,
+    )
+    assert response.status_code == 409
+    assert state["reads"] == []
+
+
+def test_selected_split_artifact_reads_its_first_part_only(test_client, preflight_env):
+    _router, state = preflight_env
+    artifact = state["details"]["artifacts"][1]
+    artifact["files"] = [
+        {"filename": f"other/model-{part:05d}-of-00002.gguf", "sizeBytes": 15 * GIB, "sha256": "f" * 64}
+        for part in (1, 2)
+    ]
+
+    response = test_client.get(
+        f"/api/models/huggingface/preflight/{REPO}?artifactId={'b' * 20}",
+        headers=test_client.auth_headers,
+    )
+
+    assert response.status_code == 200
+    assert state["reads"] == [(REPO, "c" * 40, "other/model-00001-of-00002.gguf", 15 * GIB)]
+    assert response.json()["artifactId"] == "b" * 20
+
+
+def test_mixed_repository_import_uses_selected_cached_header(test_client, preflight_env, monkeypatch):
+    router, state = preflight_env
+    other = _dense_header("qwen3", {"tokenizer.chat_template": "plain prompt"})
+    other.update(context_length=4096, block_count=24, attention_head_count_kv=4)
+    state["cached_headers"] = {"model-Q4_K_M.gguf": _dense_header(), "model-Q8_0.gguf": other}
+    monkeypatch.setattr(router, "_call_agent_model", lambda *_a, **_k: {"status": "started"})
+
+    response = _import(test_client, artifactId="b" * 20)
+
+    assert response.status_code == 200
+    assert state["reads"] == []
+    assert state["cached_reads"] == [(REPO, "c" * 40, "model-Q8_0.gguf")]
+    record = json.loads((router.Path(router.DATA_DIR) / "model-imports.json").read_text())["models"][0]
+    assert record["architecture"] == "qwen3"
+    assert record["block_count"] == 24
+    assert record["attention_head_count_kv"] == 4
+    assert record["context_length"] == record["max_context_length"] == 4096
+    assert record["template_signals"]["tools"] is False
+
+
+def test_unread_selected_artifact_does_not_inherit_a_cached_reranker(test_client, preflight_env, monkeypatch):
+    router, state = preflight_env
+    state["header"] = _dense_header("qwen3", {"qwen3.pooling_type": 4})
+    monkeypatch.setattr(router, "_call_agent_model", lambda *_a, **_k: {"status": "started"})
+
+    body = _preflight(test_client).json()
+    assert body["artifacts"]["a" * 20]["refusal"]["code"] == "not_a_chat_model:reranker"
+    assert body["artifacts"]["b" * 20]["refusal"] is None
+    state["reads"].clear()
+    response = _import(test_client, artifactId="b" * 20)
+
+    assert response.status_code == 200
+    assert state["reads"] == []
+    record = json.loads((router.Path(router.DATA_DIR) / "model-imports.json").read_text())["models"][0]
+    assert record["context_length"] == 8192
+    assert record.get("max_context_length") is None
+    assert record.get("context_source") == "unavailable"
+    for key in ("architecture", "block_count", "recurrent_state_bytes", "template_signals"):
+        assert key not in record
+
+
+@pytest.mark.parametrize("field,value", [("repoId", "other/repo"), ("revision", "d" * 40), ("artifactId", "b" * 20), ("file", "other.gguf")])
+def test_import_record_ignores_header_bound_to_another_artifact(preflight_env, field, value):
+    import asyncio
+
+    router, state = preflight_env
+    artifact = state["details"]["artifacts"][0]
+    gate = asyncio.run(router._hf_preflight_gate(state["details"], artifact, read_header=False))
+    gate["artifact"][field] = value
+
+    record = router._hf_import_record(state["details"], artifact, gate=gate)
+
+    assert "architecture" not in record
+    assert "template_signals" not in record
+    assert "block_count" not in record
+    assert record["context_length"] == 8192
 
 
 def test_storage_check_allows_for_a_windows_managed_model_store(monkeypatch):

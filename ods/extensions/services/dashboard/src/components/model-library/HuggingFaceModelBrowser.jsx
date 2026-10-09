@@ -492,9 +492,9 @@ function ArtifactDialog({ model, details, loading, error, preflight, preflightLo
                 <Metric icon={ShieldCheck} label="License" value={formatLicense(details.license)} />
                 <Metric
                   icon={Gauge}
-                  label="Context metadata"
-                  value={formatContext(preflight?.contextLength || details.contextLength)}
-                  detail={contextSourceLabel(preflight?.contextLength ? preflight.contextSource : details.contextSource)}
+                  label={preflight?.artifactId ? 'Checked artifact context' : 'Context metadata'}
+                  value={formatContext(preflight?.artifactId ? preflight.contextLength : (preflight?.contextLength || details.contextLength))}
+                  detail={contextSourceLabel(preflight?.artifactId ? preflight.contextSource : (preflight?.contextLength ? preflight.contextSource : details.contextSource))}
                 />
                 <Metric icon={HardDrive} label="Available artifacts" value={`${details.artifacts.length} choices`} />
                 <Metric icon={CheckCircle2} label="Pinned revision" value={details.sha?.slice(0, 10) || 'Unknown'} mono />
@@ -544,7 +544,7 @@ function ArtifactDialog({ model, details, loading, error, preflight, preflightLo
                         gpu={gpu}
                         check={preflight?.artifacts?.[artifact.id] || null}
                         checking={preflightLoading}
-                        refusal={refusal}
+                        refusal={preflight?.artifactId ? (preflight.artifacts?.[artifact.id]?.refusal || null) : refusal}
                         busy={downloadBusy || Boolean(importingArtifact)}
                         importing={importingArtifact === artifact.id}
                         runtimeCompatible={details.runtimeCompatible !== false}
@@ -593,6 +593,8 @@ function ArtifactRow({ artifact, gpu, check, checking, refusal, busy, importing,
       <div className="col-span-2 min-w-0 lg:col-span-1">
         <p className="truncate text-xs font-semibold text-theme-text" title={artifact.label}>{artifact.label}</p>
         <p className="mt-1 text-[10px] text-theme-text-muted">{artifact.split ? `${artifact.files.length} verified parts` : 'Single verified file'}</p>
+        {check?.header?.reason === 'not_read' && <p className="mt-1 text-[10px] text-theme-text-muted">This artifact’s header has not been checked.</p>}
+        {refusal && !refusal.overridable && refusal.code !== 'gated' && <p className="mt-1 text-[10px] text-theme-text-secondary">{refusal.message}</p>}
       </div>
       <span className="text-xs font-semibold text-theme-text-secondary">{artifact.quantization || 'Unknown'}</span>
       <span className="font-mono text-xs text-theme-text-secondary">{formatBytes(artifact.sizeBytes)}</span>
@@ -675,6 +677,7 @@ function PreflightSummary({ preflight, loading, error }) {
   const supported = runtime?.architectureSupported
   return (
     <section aria-label="Before you download" className="mb-4 space-y-2 rounded-lg border border-white/[0.07] bg-black/20 px-4 py-3 text-xs">
+      {preflight.artifactId && header?.file && <p className="text-theme-text-muted">Checks for {header.file}. Other artifacts use their own available metadata.</p>}
       {refusal && (
         <div role="alert" className={`flex items-start gap-2 rounded-md border px-3 py-2 ${refusal.overridable ? 'border-amber-400/25 bg-amber-500/10 text-amber-100' : 'border-red-400/25 bg-red-500/10 text-red-200'}`}>
           <AlertTriangle size={13} className="mt-0.5 shrink-0" />

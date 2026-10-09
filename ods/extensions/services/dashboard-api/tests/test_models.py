@@ -573,7 +573,7 @@ def test_huggingface_import_record_pins_revision_and_renames_remote_paths():
         }],
     }
 
-    record = models_router._hf_import_record(details, artifact)
+    record = models_router._hf_import_record({**details, "artifacts": [artifact]}, artifact)
 
     assert record["source"] == "huggingface"
     assert record["source_revision"] == "c" * 40
