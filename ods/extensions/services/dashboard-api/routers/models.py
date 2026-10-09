@@ -1581,6 +1581,8 @@ async def _prepare_huggingface_import(body: dict[str, Any]):
     if not _HF_REPO_RE.fullmatch(repo_id) or not re.fullmatch(r"[0-9a-f]{20}", artifact_id):
         raise HTTPException(status_code=400, detail="repoId and artifactId are required")
     details = await _hf_repo_details(repo_id)
+    if "revision" in body and body["revision"] != details.get("sha"):
+        raise HTTPException(status_code=409, detail="The repository revision changed. Reopen it and check the selected file before importing.")
     if not details["runtimeCompatible"]:
         raise HTTPException(status_code=422, detail=details["runtimeReason"])
     artifact = next((item for item in details["artifacts"] if item["id"] == artifact_id), None)

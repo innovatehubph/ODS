@@ -4,8 +4,8 @@ import HuggingFaceModelBrowser from './HuggingFaceModelBrowser'
 
 const repo = {id: 'org/model', author: 'org'}
 const artifacts = [
-  {id: 'q4', label: 'model-Q4_K_M.gguf', quantization: 'Q4_K_M', sizeBytes: 4e9, files: [{}]},
-  {id: 'q8', label: 'model-Q8_0.gguf', quantization: 'Q8_0', sizeBytes: 8e9, files: [{}]},
+  {id: 'q4', label: 'model-Q4_K_M.gguf', quantization: 'Q4_K_M', sizeBytes: 4e9, files: [{filename: 'model-Q4_K_M.gguf'}]},
+  {id: 'q8', label: 'model-Q8_0.gguf', quantization: 'Q8_0', sizeBytes: 8e9, files: [{filename: 'model-Q8_0.gguf'}]},
 ]
 const okCheck = {
   fit: {status: 'fits', contextLength: 65536, requiredGb: 6.2, capacityGb: 8, estimate: 'architecture'},
@@ -13,9 +13,10 @@ const okCheck = {
 }
 
 function preflight(overrides = {}) {
-  return {
+  const body = {
     id: 'org/model',
     sha: 'c'.repeat(40),
+    artifactId: 'q4',
     header: {status: 'read', file: 'model-Q4_K_M.gguf', bytesRead: 2000000},
     architecture: 'qwen3',
     runtime: {key: 'nvidia', build: 'b11429', architectureSupported: true},
@@ -28,19 +29,36 @@ function preflight(overrides = {}) {
     refusal: null,
     ...overrides,
   }
+  body.artifacts = Object.fromEntries(Object.entries(body.artifacts).map(([id, check]) => [id, {
+    ...check,
+    header: check.header || {status: 'read', file: artifacts.find(row => row.id === id)?.files[0].filename},
+    refusal: Object.hasOwn(check, 'refusal') ? check.refusal : body.refusal,
+  }]))
+  return body
 }
+
+const selectedPreflight = (id, overrides = {}) => preflight({
+  artifactId: id,
+  header: {status: 'read', file: artifacts.find(row => row.id === id)?.files[0].filename},
+  ...overrides,
+})
 
 let preflightBody
 let detailsBody
 let importResponse
+let selectedPreflightResponse
 beforeEach(() => {
   vi.useFakeTimers()
   preflightBody = preflight()
-  detailsBody = {...repo, artifacts}
+  detailsBody = {...repo, sha: 'c'.repeat(40), artifacts}
+  selectedPreflightResponse = id => selectedPreflight(id)
   importResponse = {ok: true, status: 200, body: {modelId: 'hf-fixture', status: 'downloading'}}
   vi.stubGlobal('fetch', vi.fn(async (url) => {
     if (url.includes('/search?')) return {ok: true, status: 200, json: async () => ({models: [repo]})}
-    if (url.includes('/preflight/')) return {ok: true, status: 200, json: async () => preflightBody}
+    if (url.includes('/preflight/')) {
+      const id = new URL(url, 'https://ods.test').searchParams.get('artifactId')
+      return {ok: true, status: 200, json: async () => id ? selectedPreflightResponse(id) : preflightBody}
+    }
     if (url.endsWith('/import')) {
       const {ok, status, body} = importResponse
       return {ok, status, headers: {get: name => (name === 'X-ODS-Import-Started' ? 'false' : null)}, json: async () => body}
@@ -98,7 +116,7 @@ test('an unsupported architecture needs an explicit Import anyway', async () => 
   const confirm = dialog.getByRole('alertdialog', {name: 'Import anyway'})
   expect(confirm).toHaveTextContent('Loading it will most likely fail')
   await act(async () => { fireEvent.click(within(confirm).getByRole('button', {name: 'Import anyway'})) })
-  expect(importBodies()).toEqual([{repoId: 'org/model', artifactId: 'q4', allowUnsupportedRuntime: true}])
+  expect(importBodies()).toEqual([{repoId: 'org/model', revision: 'c'.repeat(40), artifactId: 'q4', allowUnsupportedRuntime: true}])
 })
 
 test('an artifact without room on the model store is not importable', async () => {
@@ -109,11 +127,21 @@ test('an artifact without room on the model store is not importable', async () =
   expect(dialog.getByRole('button', {name: 'Import', exact: true})).toBeEnabled()
 })
 
-test('a failed check never blocks an import', async () => {
+test('a failed repository check leaves an artifact-specific check available', async () => {
   preflightBody = {status: 'idle'}
   const dialog = await open()
   expect(dialog.getByText(/Could not check this repository before download/)).toBeVisible()
   expect(dialog.getAllByRole('button', {name: 'Import', exact: true})).toHaveLength(2)
+})
+
+test('an initial response from another revision is discarded before selecting an artifact', async () => {
+  preflightBody = preflight({sha: 'd'.repeat(40), architecture: 'wrong-revision'})
+  const dialog = await open()
+  expect(dialog.getByText(/Could not check this repository before download/)).toBeVisible()
+  expect(dialog.queryByText(/wrong-revision/)).toBeNull()
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[0]) })
+  expect(fetch.mock.calls.filter(([url]) => url.includes('artifactId=q4'))).toHaveLength(1)
+  expect(importBodies()).toEqual([{repoId: repo.id, revision: 'c'.repeat(40), artifactId: 'q4'}])
 })
 
 test('a server-side runtime refusal offers Import anyway once', async () => {
@@ -130,8 +158,8 @@ test('a server-side runtime refusal offers Import anyway once', async () => {
   importResponse = {ok: true, status: 200, body: {modelId: 'hf-fixture', status: 'downloading'}}
   await act(async () => { fireEvent.click(dialog.getByRole('button', {name: 'Import anyway'})) })
   expect(importBodies()).toEqual([
-    {repoId: 'org/model', artifactId: 'q4'},
-    {repoId: 'org/model', artifactId: 'q4', allowUnsupportedRuntime: true},
+    {repoId: 'org/model', revision: 'c'.repeat(40), artifactId: 'q4'},
+    {repoId: 'org/model', revision: 'c'.repeat(40), artifactId: 'q4', allowUnsupportedRuntime: true},
   ])
 })
 
@@ -152,7 +180,7 @@ test('a gated repository says how to get access, once, and cannot be imported ye
 
 test('a repository ODS does not run as a chat model links to help without a pre-download check', async () => {
   repo.runtimeCompatible = false
-  detailsBody = {...repo, artifacts, runtimeCompatible: false, runtimeReason: 'Text Ranking requires a dedicated ODS runtime'}
+  detailsBody = {...repo, sha: 'c'.repeat(40), artifacts, runtimeCompatible: false, runtimeReason: 'Text Ranking requires a dedicated ODS runtime'}
   try {
     const dialog = await open('Inspect')
     expect(dialog.getByText(/ODS will not route it through the LLM runtime/)).toBeVisible()
@@ -164,8 +192,8 @@ test('a repository ODS does not run as a chat model links to help without a pre-
 })
 
 test('the context label names where the number came from', async () => {
-  detailsBody = {...repo, artifacts, contextLength: 32768, contextSource: 'gguf_metadata'}
-  preflightBody = preflight({contextLength: 32768, contextSource: 'gguf_metadata', header: {status: 'unavailable', reason: 'rate_limited', message: 'rate limited'}})
+  detailsBody = {...repo, sha: 'c'.repeat(40), artifacts, contextLength: 32768, contextSource: 'gguf_metadata'}
+  preflightBody = preflight({contextLength: 32768, contextSource: 'gguf_metadata', header: {status: 'unavailable', file: 'model-Q4_K_M.gguf', reason: 'rate_limited', message: 'rate limited'}})
   const dialog = await open()
   expect(dialog.getByText('GGUF metadata')).toBeVisible()
   expect(dialog.queryByText('This file’s GGUF header')).toBeNull()
@@ -192,12 +220,131 @@ test('a mixed repository scopes checked-file evidence and refusal to its artifac
   expect(dialog.getByText('This artifact’s header has not been checked.')).toBeVisible()
   expect(dialog.getByText('Fits at 64K tokens (rough estimate)')).toBeVisible()
   await act(async () => { fireEvent.click(dialog.getByRole('button', {name: 'Import', exact: true})) })
-  expect(importBodies()).toEqual([{repoId: 'org/model', artifactId: 'q8'}])
+  expect(importBodies()).toEqual([{repoId: 'org/model', revision: 'c'.repeat(40), artifactId: 'q8'}])
+  expect(fetch.mock.calls.filter(([url]) => url.includes('/preflight/'))).toHaveLength(2)
+})
+
+function unreadSecondArtifact() {
+  preflightBody = preflight({artifacts: {
+    q4: okCheck,
+    q8: {...okCheck, header: {status: 'unavailable', file: 'model-Q8_0.gguf', reason: 'not_read'}},
+  }})
+}
+
+test('unchecked import waits for exactly one selected-artifact check before posting', async () => {
+  unreadSecondArtifact()
+  let finish
+  selectedPreflightResponse = () => new Promise(resolve => { finish = resolve })
+  const dialog = await open()
+  const button = dialog.getAllByRole('button', {name: 'Import', exact: true})[1]
+  await act(async () => { fireEvent.click(button); fireEvent.click(button) })
+  expect(dialog.getByRole('button', {name: 'Checking file…'})).toBeDisabled()
+  expect(importBodies()).toEqual([])
+  expect(fetch.mock.calls.filter(([url]) => url.includes('artifactId=q8'))).toHaveLength(1)
+  await act(async () => { finish(selectedPreflight('q8')) })
+  expect(importBodies()).toEqual([{repoId: repo.id, revision: 'c'.repeat(40), artifactId: 'q8'}])
+})
+
+test('matching checked metadata needs no additional network preflight', async () => {
+  const dialog = await open()
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[0]) })
   expect(fetch.mock.calls.filter(([url]) => url.includes('/preflight/'))).toHaveLength(1)
+  expect(importBodies()).toEqual([{repoId: repo.id, revision: 'c'.repeat(40), artifactId: 'q4'}])
+})
+
+test('selected unsupported architecture waits for explicit override without another check', async () => {
+  unreadSecondArtifact()
+  const refusal = {code: 'runtime_architecture_unsupported', message: 'This selected file needs a newer runtime.', overridable: true}
+  selectedPreflightResponse = id => selectedPreflight(id, {refusal, artifacts: {
+    q4: {...okCheck, refusal: null}, q8: {...okCheck, refusal},
+  }})
+  const dialog = await open()
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[1]) })
+  expect(importBodies()).toEqual([])
+  expect(dialog.getByRole('button', {name: 'Import', exact: true})).toBeEnabled()
+  await act(async () => { fireEvent.click(dialog.getByRole('button', {name: 'Import anyway…'})) })
+  expect(importBodies()).toEqual([])
+  await act(async () => { fireEvent.click(within(dialog.getByRole('alertdialog')).getByRole('button', {name: 'Import anyway'})) })
+  expect(importBodies()).toEqual([{repoId: repo.id, revision: 'c'.repeat(40), artifactId: 'q8', allowUnsupportedRuntime: true}])
+  expect(fetch.mock.calls.filter(([url]) => url.includes('artifactId=q8'))).toHaveLength(1)
+})
+
+test('selected non-chat refusal never posts an import', async () => {
+  unreadSecondArtifact()
+  const refusal = {code: 'not_a_chat_model:reranker', message: 'The selected file is a reranker.', overridable: false}
+  selectedPreflightResponse = id => selectedPreflight(id, {refusal, artifacts: {
+    q4: {...okCheck, refusal: null}, q8: {...okCheck, refusal},
+  }})
+  const dialog = await open()
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[1]) })
+  expect(dialog.getByRole('button', {name: 'Not supported'})).toBeDisabled()
+  expect(importBodies()).toEqual([])
+})
+
+test('a timed-out check offers retry and never claims a possibly-started download', async () => {
+  unreadSecondArtifact()
+  selectedPreflightResponse = () => new Promise(() => {})
+  const dialog = await open()
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[1]) })
+  await act(async () => { vi.advanceTimersByTime(30000) })
+  expect(importBodies()).toEqual([])
+  expect(dialog.getByRole('alert')).toHaveTextContent('No download was requested')
+  expect(dialog.queryByText(/host may still be processing/)).toBeNull()
+  expect(dialog.queryByRole('button', {name: 'Check download status'})).toBeNull()
+  selectedPreflightResponse = id => selectedPreflight(id)
+  await act(async () => { fireEvent.click(dialog.getByRole('button', {name: 'Retry check'})) })
+  expect(importBodies()).toEqual([{repoId: repo.id, revision: 'c'.repeat(40), artifactId: 'q8'}])
+  expect(fetch.mock.calls.filter(([url]) => url.includes('artifactId=q8'))).toHaveLength(2)
+})
+
+test.each(['id', 'sha', 'artifactId', 'file'])('a mismatched selected response (%s) never posts', async field => {
+  unreadSecondArtifact()
+  selectedPreflightResponse = id => {
+    const response = selectedPreflight(id)
+    if (field === 'file') response.artifacts[id].header.file = 'different.gguf'
+    else response[field] = 'different'
+    return response
+  }
+  const dialog = await open()
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[1]) })
+  expect(dialog.getByRole('alert')).toHaveTextContent('did not match this repository revision and file')
+  expect(importBodies()).toEqual([])
+})
+
+test('a closed and reopened dialog ignores the old check without unlocking a newer one', async () => {
+  unreadSecondArtifact()
+  const completions = []
+  selectedPreflightResponse = () => new Promise(resolve => completions.push(resolve))
+  let dialog = await open()
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[1]) })
+  await act(async () => { fireEvent.click(dialog.getByTitle('Close')) })
+  await act(async () => { fireEvent.click(screen.getByRole('button', {name: 'Choose file'})) })
+  dialog = within(screen.getByRole('dialog'))
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[1]) })
+  await act(async () => { completions[0](selectedPreflight('q8')) })
+  expect(importBodies()).toEqual([])
+  expect(dialog.getByRole('button', {name: 'Checking file…'})).toBeDisabled()
+  await act(async () => { completions[1](selectedPreflight('q8')) })
+  expect(importBodies()).toEqual([{repoId: repo.id, revision: 'c'.repeat(40), artifactId: 'q8'}])
+})
+
+test('unavailable selected metadata requires an explicit unknown-data import', async () => {
+  unreadSecondArtifact()
+  selectedPreflightResponse = id => selectedPreflight(id, {
+    header: {status: 'unavailable', file: 'model-Q8_0.gguf', reason: 'rate_limited'},
+    artifacts: {q4: okCheck, q8: {...okCheck, header: {status: 'unavailable', file: 'model-Q8_0.gguf', reason: 'rate_limited'}}},
+  })
+  const dialog = await open()
+  await act(async () => { fireEvent.click(dialog.getAllByRole('button', {name: 'Import', exact: true})[1]) })
+  expect(importBodies()).toEqual([])
+  expect(dialog.getByRole('alert')).toHaveTextContent('architecture, context and template remain unknown')
+  await act(async () => { fireEvent.click(dialog.getByRole('button', {name: 'Import with unknown metadata'})) })
+  expect(importBodies()).toEqual([{repoId: repo.id, revision: 'c'.repeat(40), artifactId: 'q8'}])
+  expect(fetch.mock.calls.filter(([url]) => url.includes('artifactId=q8'))).toHaveLength(1)
 })
 
 test('artifact-bound unknown context does not fall back to an unrelated Hub value', async () => {
-  detailsBody = {...repo, artifacts, contextLength: 131072, contextSource: 'gguf_metadata'}
+  detailsBody = {...repo, sha: 'c'.repeat(40), artifacts, contextLength: 131072, contextSource: 'gguf_metadata'}
   preflightBody = preflight({artifactId: 'q4', contextLength: null, contextSource: 'unavailable'})
   const dialog = await open()
   expect(dialog.getByText('Checked artifact context')).toBeVisible()

@@ -360,6 +360,31 @@ def test_import_never_waits_on_a_hub_header_read(test_client, preflight_env, mon
     assert state["reads"] == []
 
 
+def test_import_accepts_the_checked_repository_revision(test_client, preflight_env, monkeypatch):
+    router, state = preflight_env
+    monkeypatch.setattr(router, "_call_agent_model", lambda *_a, **_k: {"status": "started"})
+
+    response = _import(test_client, revision="c" * 40)
+
+    assert response.status_code == 200
+    assert state["reads"] == []
+    record = json.loads((router.Path(router.DATA_DIR) / "model-imports.json").read_text())["models"][0]
+    assert record["source_revision"] == "c" * 40
+
+
+def test_import_rejects_changed_revision_before_cache_registration_or_dispatch(test_client, preflight_env, monkeypatch):
+    router, state = preflight_env
+    monkeypatch.setattr(router, "_call_agent_model", lambda *_a, **_k: pytest.fail("not dispatched"))
+
+    response = _import(test_client, revision="d" * 40, allowUnsupportedRuntime=True)
+
+    assert response.status_code == 409
+    assert response.headers["X-ODS-Import-Started"] == "false"
+    assert "revision changed" in response.json()["detail"]
+    assert state["reads"] == state["cached_reads"] == []
+    assert not (router.Path(router.DATA_DIR) / "model-imports.json").exists()
+
+
 def test_import_without_a_cached_header_gates_on_the_hub_summary(test_client, preflight_env, monkeypatch):
     models_router, state = preflight_env
     monkeypatch.setattr(models_router, "GPU_BACKEND", "amd")
