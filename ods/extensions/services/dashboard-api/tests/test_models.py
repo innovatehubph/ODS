@@ -704,7 +704,7 @@ def test_huggingface_import_retains_retry_state_after_agent_failure(
 
     attempts = 0
 
-    def flaky_agent(_path, payload):
+    def flaky_agent(_path, payload, **_kwargs):
         nonlocal attempts
         attempts += 1
         assert payload["gguf_sha256"] == "e" * 64
@@ -815,7 +815,7 @@ def test_huggingface_import_disk_refusal_is_definitively_not_started(
     async def fake_details(_repo_id):
         return _hf_import_details()
 
-    def refuse(_path, _payload):
+    def refuse(_path, _payload, **_kwargs):
         raise models_router.HTTPException(
             status_code=507,
             detail=models_router._insufficient_disk_detail({

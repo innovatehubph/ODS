@@ -289,7 +289,7 @@ def test_import_anyway_records_the_acknowledged_runtime(test_client, preflight_e
     state["header"] = _dense_header("nanbeige")
     dispatched = []
 
-    def dispatch(_path, payload):
+    def dispatch(_path, payload, **_kwargs):
         dispatched.append(payload)
         return {"status": "started"}
 
@@ -319,7 +319,7 @@ def test_import_anyway_cannot_import_a_reranker_as_a_chat_model(test_client, pre
 
 def test_import_record_carries_the_header_layout_and_context(test_client, preflight_env, monkeypatch):
     models_router, _state = preflight_env
-    monkeypatch.setattr(models_router, "_call_agent_model", lambda path, payload: {"status": "started"})
+    monkeypatch.setattr(models_router, "_call_agent_model", lambda path, payload, **_kwargs: {"status": "started"})
 
     response = _import(test_client)
 
@@ -352,7 +352,7 @@ def test_search_rows_flag_text_ranking_repositories():
 
 def test_import_never_waits_on_a_hub_header_read(test_client, preflight_env, monkeypatch):
     models_router, state = preflight_env
-    monkeypatch.setattr(models_router, "_call_agent_model", lambda path, payload: {"status": "started"})
+    monkeypatch.setattr(models_router, "_call_agent_model", lambda path, payload, **_kwargs: {"status": "started"})
 
     response = _import(test_client)
 
@@ -541,7 +541,7 @@ def test_import_waits_out_a_short_lifecycle_hold(test_client, preflight_env, mon
     models_router, _state = preflight_env
     calls = []
 
-    def agent(path, payload):
+    def agent(path, payload, **_kwargs):
         calls.append(path)
         if len(calls) < 3:
             # The integrity check a restarted agent runs, then a Pixel re-proof.
@@ -561,7 +561,7 @@ def test_a_busy_host_refuses_the_import_in_words_without_starting_it(test_client
     models_router, _state = preflight_env
     calls = []
 
-    def agent(path, payload):
+    def agent(path, payload, **_kwargs):
         calls.append(path)
         raise _busy("model_activation")
 
@@ -580,15 +580,17 @@ def test_a_short_hold_that_outlasts_the_grace_still_ends_in_words(test_client, p
     models_router, _state = preflight_env
     clock = [1000.0]
 
-    def agent(path, payload):
-        clock[0] += 20.0
+    def agent(path, payload, *, timeout):
+        clock[0] += min(20.0, timeout)
         raise _busy("artifact_verification")
 
     monkeypatch.setattr(models_router, "_call_agent_model", agent)
     monkeypatch.setattr(models_router.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(models_router.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(models_router.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
 
     response = _import(test_client)
 
     assert response.status_code == 409
     assert "checking a downloaded model file" in response.json()["detail"]["message"]
+    assert clock[0] == 1030.0
+    assert response.headers["X-ODS-Import-Started"] == "false"

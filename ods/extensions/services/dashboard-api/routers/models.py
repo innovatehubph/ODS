@@ -2085,7 +2085,8 @@ _MODEL_PIXEL_BUSY_ACTIVATION_GRACE_SECONDS = 30.0
 # Short holds a download or import waits out instead of refusing: the Pixel
 # access re-proof above, and the integrity check a restarted host agent runs
 # when it finds a download status left "verifying" (minutes after an install,
-# Mac, 2026-10-09). Kept inside the Models page's 45 s import deadline.
+# Mac, 2026-10-09). This retry grace is not the whole import deadline:
+# metadata preparation and the transport's other timeout phases are separate.
 _DOWNLOAD_SHORT_HOLD_OPERATIONS = _PIXEL_LIFECYCLE_OPERATIONS | {"artifact_verification"}
 _DOWNLOAD_SHORT_HOLD_GRACE_SECONDS = 30.0
 _LIFECYCLE_BUSY_WORDS = {
@@ -2176,7 +2177,7 @@ def _lifecycle_busy_detail(detail: dict[str, Any]) -> dict[str, Any]:
 def _call_agent_model(
     path: str,
     body: dict,
-    timeout: int = 30,
+    timeout: float = 30,
     *,
     retry_download_busy_seconds: float = 0.0,
     retry_pixel_busy_seconds: float = 0.0,
@@ -2223,18 +2224,22 @@ def _call_agent_model(
 
 def _request_agent_download(payload: dict) -> dict:
     """Start a host-agent download; wait out short holds, refuse longer ones in words."""
-    deadline = time.monotonic() + _DOWNLOAD_SHORT_HOLD_GRACE_SECONDS
+    remaining = _DOWNLOAD_SHORT_HOLD_GRACE_SECONDS
+    deadline = time.monotonic() + remaining
     while True:
         try:
-            return _call_agent_model("/v1/model/download", payload)
+            return _call_agent_model("/v1/model/download", payload, timeout=remaining)
         except HTTPException as exc:
             detail = exc.detail
             if exc.status_code != 409 or not isinstance(detail, dict) \
                     or detail.get("code") != "model_lifecycle_busy":
                 raise
-            if _is_short_lifecycle_hold(detail) and time.monotonic() < deadline:
-                time.sleep(0.5)
-                continue
+            remaining = deadline - time.monotonic()
+            if _is_short_lifecycle_hold(detail) and remaining > 0:
+                time.sleep(min(0.5, remaining))
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    continue
             raise HTTPException(status_code=409, detail=_lifecycle_busy_detail(detail)) from exc
 
 
