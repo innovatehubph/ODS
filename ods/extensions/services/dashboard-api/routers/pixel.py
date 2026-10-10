@@ -80,18 +80,19 @@ _MODEL_CAPABILITY_DETAIL = (
 # reason; this text serves API readers and older dashboards.
 _MODEL_SUPPORT_REASONS = {
     "context-too-small": (
-        f"The active model runs with less than {PIXEL_MIN_CONTEXT // 1024}K tokens of context, "
-        "too small for Portal tasks. Load it with more context in Models, or switch models."
+        f"This model runs with less than {PIXEL_MIN_CONTEXT // 1024}K tokens of context, too small for "
+        f"Portal tasks. Set its context to {PIXEL_MIN_CONTEXT // 1024}K or more in Models, or switch model."
     ),
     "tools-unavailable": (
-        "The active model did not complete a tool call when ODS checked it. "
-        "Tool-driven tasks may fail; chat still works."
+        "This model failed the tool-call check, so Portal tasks that use tools will likely fail. "
+        "Chat still works."
     ),
     "not-profiled": (
-        "ODS has not checked what the active model can do. Use Check again in Models."
+        "ODS has not checked this model yet, so Portal tasks may not work. To check it, choose "
+        "Check again on the running model in Models."
     ),
     "thinking-always-on": (
-        "The active model always thinks before it answers, so replies take longer."
+        "This model always thinks before it answers, so Portal tasks are slower and use more of its context."
     ),
 }
 

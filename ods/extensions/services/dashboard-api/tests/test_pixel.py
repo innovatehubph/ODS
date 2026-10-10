@@ -1254,3 +1254,12 @@ async def test_chat_activity_ambiguity_is_unknown_not_global_activity(response):
 async def test_chat_activity_transport_failure_is_sanitized():
     with patch.object(pixel.httpx, "AsyncClient", side_effect=pixel.httpx.ConnectError("private credential")):
         assert await pixel.pixel_chat_activity(pixel.ChatCancelRequest(chat_id="opaque_chat_1")) == {"state": "unknown"}
+
+
+def test_profile_advisory_texts_match_the_dashboard_copy():
+    # The dashboard shows its own copy per reason; API readers and older
+    # dashboards get the same words.
+    page = pathlib.Path(__file__).resolve().parents[2] / "dashboard" / "src" / "pages" / "Pixel.jsx"
+    source = page.read_text(encoding="utf-8")
+    for reason, text in pixel._MODEL_SUPPORT_REASONS.items():
+        assert f"['{reason}', '{text}']" in source
