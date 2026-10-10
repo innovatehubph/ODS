@@ -1879,9 +1879,10 @@ function getCompatibilityMeta(model, memory, pixelMinimumContext = 0) {
       return { label: 'Shorter context', detail: 'Fits GPU', tone: 'amber' }
     }
     const nearLimit = memory.total > 0 && memory.required <= memory.total * 1.08
+    // Run stays available after an explicit tick, so this is not "incompatible".
     return {
       label: nearLimit ? 'High VRAM' : 'Too large',
-      detail: nearLimit ? 'Heavy' : 'Incompatible',
+      detail: nearLimit ? 'Heavy' : 'May not load',
       tone: nearLimit ? 'amber' : 'red',
     }
   }
