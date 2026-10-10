@@ -9,6 +9,8 @@ import pytest
 
 
 WRITER = Path(__file__).resolve().parents[1] / 'installers/lib/pixel-runtime-budget.py'
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
+import pixel_model_contract  # noqa: E402
 
 
 def configuration(context=16384):
@@ -260,6 +262,10 @@ def test_thinking_control_selects_the_openclaw_thinking_config(tmp_path, model, 
     agent = value['agents']['list'][0]
     assert (row['reasoning'], row.get('compat'), agent.get('thinkingDefault'),
             agent.get('params', {}).get('chat_template_kwargs')) == expected
+    # The native model coordinator reads every result with an unchanged contract shape.
+    contract = pixel_model_contract.projection(value)['contract']
+    assert set(contract) == {'model', 'contextLength', 'maxTokens', 'reasoning', 'imageInput'}
+    assert contract['reasoning'] is expected[0]
 
 
 @pytest.mark.parametrize('model,reasoning,control', [
