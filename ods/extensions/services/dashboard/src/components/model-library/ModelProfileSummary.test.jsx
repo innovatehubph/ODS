@@ -21,16 +21,23 @@ const capable = {
 
 let profileBody
 let recheckResponse
+let templateResponse
 beforeEach(() => {
   profileBody = {mode: 'observe', modelId: 'qwen3.5-9b', profile: profile(capable)}
   recheckResponse = {ok: true, status: 200, body: {status: 'recorded'}}
+  templateResponse = {ok: true, status: 200, body: {status: 'activated', chatTemplateOverride: 'qwen-tools-fix'}}
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     if (url.endsWith('/profile/recheck') && options?.method === 'POST') {
       return {ok: recheckResponse.ok, status: recheckResponse.status, json: async () => recheckResponse.body}
     }
+    if (url.endsWith('/chat-template') && options?.method === 'POST') {
+      return {ok: templateResponse.ok, status: templateResponse.status, json: async () => templateResponse.body}
+    }
     return {ok: true, status: 200, json: async () => profileBody}
   }))
 })
+
+const offer = {id: 'qwen-tools-fix', reason: 'Its own template drops tool calls.', active: false, supported: true}
 afterEach(() => vi.unstubAllGlobals())
 
 async function show() {
@@ -101,6 +108,51 @@ test('Check again re-measures, and a refusal is shown in words', async () => {
   recheckResponse = {ok: false, status: 409, body: {detail: {error: 'Only the running model can be checked; run it first'}}}
   await act(async () => { fireEvent.click(screen.getByRole('button', {name: 'Check again'})) })
   await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Only the running model can be checked'))
+})
+
+test('no fixed-template action shows without an exact match from the server', async () => {
+  profileBody.profile = profile({...capable, chat: false})
+  await show()
+  expect(screen.queryByRole('button', {name: 'Try a fixed template'})).toBeNull()
+  expect(screen.queryByText(/fixed chat template/)).toBeNull()
+})
+
+test('an exact match offers a fixed template, and trying it restarts the model with it', async () => {
+  profileBody.profile = profile({...capable, chat: false})
+  profileBody.templateOverride = offer
+  await show()
+  expect(screen.getByText('A fixed chat template is available for this model. Its own template drops tool calls.')).toBeVisible()
+  expect(screen.getByRole('link', {name: 'Get help on Discord'})).toBeVisible()
+
+  profileBody.templateOverride = {...offer, active: true}
+  await act(async () => { fireEvent.click(screen.getByRole('button', {name: 'Try a fixed template'})) })
+
+  expect(fetch).toHaveBeenCalledWith('/api/models/qwen3.5-9b/chat-template', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({override: 'qwen-tools-fix'}),
+  })
+  await waitFor(() => expect(screen.getByText('Uses a fixed chat template')).toBeVisible())
+  expect(screen.queryByRole('button', {name: 'Try a fixed template'})).toBeNull()
+})
+
+test('a refused fixed template is explained in words', async () => {
+  profileBody.templateOverride = offer
+  templateResponse = {ok: false, status: 409, body: {detail: {
+    code: 'chat_template_override_not_matched',
+    error: 'This fixed chat template is not for this model. Nothing was changed.',
+  }}}
+  await show()
+  await act(async () => { fireEvent.click(screen.getByRole('button', {name: 'Try a fixed template'})) })
+  await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('This fixed chat template is not for this model.'))
+})
+
+test('a runtime that cannot use the fixed template says so, with help and no action', async () => {
+  profileBody.templateOverride = {...offer, supported: false}
+  await show()
+  expect(screen.getByText(/cannot use it yet/)).toBeVisible()
+  expect(screen.queryByRole('button', {name: 'Try a fixed template'})).toBeNull()
+  expect(screen.getByRole('link', {name: 'Get help on Discord'})).toBeVisible()
 })
 
 test('the activation notice names the first-time check', () => {

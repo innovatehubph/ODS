@@ -282,6 +282,17 @@ from the next switch:
 **Check again** updates the Portal and Talk advisories at once; the route and
 Portal's agent settings follow on the next switch.
 
+#### Fixed chat templates
+
+A few models carry a chat template that does not work well with llama.cpp,
+for example one that loses tool calls. ODS ships fixed templates from
+llama.cpp for templates it knows to be broken (`config/chat-templates/`,
+reviewed like code and checked by SHA-256). When the check shows that the
+running model's own template is exactly one of them, the Models page offers
+**Try a fixed template**: ODS restarts the model with the fixed template and
+checks it again. A later switch clears it. Templates are never downloaded
+while ODS runs. The Windows model runtimes cannot use a fixed template yet.
+
 ### Choosing the runtime context
 
 Before loading a model, the Dashboard offers context presets derived from the

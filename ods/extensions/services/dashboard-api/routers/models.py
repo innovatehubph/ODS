@@ -2776,6 +2776,16 @@ def load_model(
     api_key: str = Depends(verify_api_key),
 ):
     """Activate a model — update config and restart llama-server."""
+    return _activate_model(model_id, body)
+
+
+def _activate_model(model_id: str, body: dict[str, Any] | None, *, chat_template_override: str | None = None):
+    """Run ``model_id`` through the host agent's activation transaction.
+
+    ``chat_template_override`` (any-model WP5) asks for the model's fixed
+    chat template; such a request always restarts the runtime, even when the
+    model already runs.
+    """
     mode_denial = _model_activation_mode_denial(
         ODS_MODE_EFFECTIVE,
         _configured_ods_mode(),
@@ -2822,7 +2832,7 @@ def load_model(
         and served_context is not None
         and served_context < HERMES_MIN_CONTEXT <= policy_context
     )
-    if already_active and not raise_below_floor and (
+    if chat_template_override is None and already_active and not raise_below_floor and (
         requested_context is None
         or requested_context == served_context
     ):
@@ -2882,6 +2892,8 @@ def load_model(
             activation_context = configured_context
     if activation_context is not None:
         activation_body["context_length"] = activation_context
+    if chat_template_override is not None:
+        activation_body["chat_template_override"] = chat_template_override
     try:
         result = _call_agent_model(
             "/v1/model/activate",
@@ -2921,6 +2933,46 @@ def recheck_model_profile(model_id: str, api_key: str = Depends(verify_api_key))
     return _call_agent_model(
         "/v1/model/profile/recheck", {"model": model_id}, timeout=_MODEL_PROFILE_RECHECK_TIMEOUT_SECONDS,
     )
+
+
+# A fixed chat template's id, as config/chat-templates/index.json spells it.
+_CHAT_TEMPLATE_ID_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?")
+
+
+def _chat_template_unavailable_reason() -> str | None:
+    """Why this runtime cannot load a fixed chat template, or None when it can."""
+    mode = read_live_env_values(("AMD_INFERENCE_RUNTIME_MODE",)).get("AMD_INFERENCE_RUNTIME_MODE")
+    if str(mode or "").strip().casefold() in _LEGACY_WINDOWS_NATIVE_MODES or _windows_hosted_runtime():
+        return "The Windows model runtime on this machine cannot use a fixed chat template yet. Nothing was changed."
+    return None
+
+
+@router.post("/api/models/{model_id}/chat-template")
+def run_with_fixed_chat_template(
+    model_id: str,
+    body: dict[str, Any] | None = Body(default=None),
+    api_key: str = Depends(verify_api_key),
+):
+    """Run a model with ODS's fixed chat template for it (any-model WP5).
+
+    The host agent accepts the template only when its index fixes exactly the
+    template this model was measured with. A running model keeps its context.
+    """
+    override = body.get("override") if isinstance(body, dict) and set(body) == {"override"} else None
+    if not isinstance(override, str) or not _CHAT_TEMPLATE_ID_RE.fullmatch(override):
+        raise HTTPException(status_code=400, detail='Ask for a fixed chat template as {"override": "<id>"}.')
+    reason = _chat_template_unavailable_reason()
+    if reason is not None:
+        raise HTTPException(status_code=409, detail={
+            "code": "chat_template_override_unsupported", "message": reason, "requestedModelId": model_id,
+        })
+    model = _find_loadable_model(model_id)
+    activation = None
+    if model is not None and _configured_model_identity_matches(model):
+        configured = _configured_context_length()
+        if configured is not None and _MIN_MODEL_CONTEXT <= configured <= _MAX_MODEL_CONTEXT:
+            activation = {"context_length": configured}
+    return _activate_model(model_id, activation, chat_template_override=override)
 
 
 @router.post("/api/models/{model_id}/benchmark")

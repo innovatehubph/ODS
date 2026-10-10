@@ -13019,11 +13019,7 @@ class AgentHandler(BaseHTTPRequestHandler):
         if _model_profile_store is None:
             json_response(self, 200, {"mode": "off", "modelId": requested or None, "profile": None})
             return
-        try:
-            doc = _model_profile_store.load(_model_profile_path())
-        except _model_profile_store.StoreError as exc:
-            logger.warning("Model profile store unreadable: %s", exc)
-            doc = _model_profile_store.empty()
+        doc = _model_profile_doc()
         last = doc.get("lastActivation") or {}
         model_id = requested or str(last.get("modelId") or "")
         profile = None
@@ -13031,7 +13027,13 @@ class AgentHandler(BaseHTTPRequestHandler):
             profile = next((entry for entry in doc["profiles"] if entry["keyHash"] == last.get("keyHash")), None)
         if profile is None and model_id:
             profile = _model_profile_store.latest_for_model(doc, model_id)
-        json_response(self, 200, {"mode": mode, "modelId": model_id or None, "profile": profile})
+        payload = {"mode": mode, "modelId": model_id or None, "profile": profile}
+        # A fixed chat template (WP5) is named only when one matches this
+        # model exactly or runs with it; every other answer is unchanged.
+        offer = _chat_template_offer(env, doc, model_id, profile) if mode != "off" and model_id else None
+        if offer is not None:
+            payload["templateOverride"] = offer
+        json_response(self, 200, payload)
 
     def _handle_model_profile_recheck(self):
         """Measure the running model again, ignoring its stored profile."""
@@ -13841,6 +13843,22 @@ class AgentHandler(BaseHTTPRequestHandler):
                 json_response(self, 400, {"error": "tier is not supported"})
                 return
 
+        # The owner's "Try a fixed template" (WP5): run the model with the
+        # index entry that fixes exactly its measured template, or refuse.
+        requested_template = body.get("chat_template_override")
+        template_override = None
+        if requested_template is not None:
+            if (not isinstance(requested_template, str)
+                    or (_model_profile_templates is not None
+                        and not re.fullmatch(_model_profile_templates.ID_PATTERN, requested_template))):
+                json_response(self, 400, {"error": "chat_template_override must be the id of a fixed chat template"})
+                return
+            template_override, refusal = _chat_template_request(
+                load_env(INSTALL_DIR / ".env"), model_id, requested_template)
+            if refusal is not None:
+                json_response(self, 409, {**refusal, "requestedModelId": model_id})
+                return
+
         acquired, active_model_id = _begin_model_activation(model_id)
         if not acquired:
             with _model_lifecycle_state_lock:
@@ -13867,6 +13885,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                 activation_options["requested_context_length"] = requested_context_length
             if requested_tier is not None:
                 activation_options["requested_tier"] = requested_tier
+            if template_override is not None:
+                activation_options["template_override"] = template_override
             self._do_model_activate(model_id, **activation_options)
         finally:
             _end_model_activation()
@@ -15304,6 +15324,8 @@ class AgentHandler(BaseHTTPRequestHandler):
                         "gpu_assignment_changed": bool(gpu_assignment_plan),
                         "consumers": consumers,
                         "profile": model_profile_status,
+                        **({"chatTemplateOverride": template_override["id"]}
+                           if template_override is not None else {}),
                     },
                 )
             else:
@@ -15817,6 +15839,70 @@ def _chat_template_refusal(env: dict, wsl_managed: dict, entry: dict) -> dict | 
                          "run the installer again to restore the template files.",
                 "code": "chat_template_override_unavailable"}
     return None
+
+
+def _model_profile_doc() -> dict:
+    """The profile store, or an empty one when it cannot be read (logged)."""
+    try:
+        return _model_profile_store.load(_model_profile_path())
+    except _model_profile_store.StoreError as exc:
+        logger.warning("Model profile store unreadable: %s", exc)
+        return _model_profile_store.empty()
+
+
+def _chat_template_match(doc: dict, model_id: str, entries: list[dict]) -> dict | None:
+    """The index entry for exactly the template this model was last measured with, if any.
+
+    The evidence is the model's newest profile made with its own template:
+    its /props template hash and llama.cpp build must match an entry exactly
+    (PLAN D3: exact-hash matches only).
+    """
+    for profile in reversed(doc["profiles"]):
+        if profile["modelId"] == model_id and profile["key"]["templateSource"] == "embedded":
+            return _model_profile_templates.match(
+                entries, profile["key"]["templateSha256"], profile["key"]["buildInfo"])
+    return None
+
+
+def _chat_template_request(env: dict, model_id: str, override_id: str) -> tuple[dict | None, dict | None]:
+    """``(index entry, None)`` when the owner may run ``model_id`` with ``override_id``, else ``(None, refusal)``."""
+    if _model_profiles_mode(env) == "off":
+        return None, {"error": "Model profiles are turned off on this machine, so ODS cannot check which chat "
+                               "template this model needs. Nothing was changed.",
+                      "code": "profiles_off"}
+    if _model_profile_templates is None or _model_profile_store is None:
+        return None, {"error": "This installation is missing its chat template support files. Nothing was "
+                               "changed; run the installer again to restore them.",
+                      "code": "chat_template_override_unavailable"}
+    entries = _chat_template_overrides()
+    entry = _model_profile_templates.entry_by_id(entries, override_id)
+    if entry is None:
+        return None, {"error": f"ODS has no fixed chat template called {override_id}. Nothing was changed.",
+                      "code": "chat_template_override_unknown"}
+    matched = _chat_template_match(_model_profile_doc(), model_id, entries)
+    if matched is None or matched["id"] != entry["id"]:
+        return None, {"error": "This fixed chat template is not for this model: ODS uses one only when the "
+                               "model's own template is exactly the one it fixes. Nothing was changed.",
+                      "code": "chat_template_override_not_matched"}
+    return entry, None
+
+
+def _chat_template_offer(env: dict, doc: dict, model_id: str, profile: dict | None) -> dict | None:
+    """What the Models page may show about a fixed template for ``model_id`` (only when there is one)."""
+    if _model_profile_templates is None:
+        return None
+    entries = _chat_template_overrides()
+    active_id = _active_chat_template_override(env)
+    shown_source = ((profile or {}).get("key") or {}).get("templateSource")
+    last = doc.get("lastActivation") or {}
+    if active_id and shown_source == f"override:{active_id}" and last.get("modelId") == model_id:
+        entry = _model_profile_templates.entry_by_id(entries, active_id) or {}
+        return {"id": active_id, "reason": entry.get("reason", ""), "active": True, "supported": True}
+    entry = _chat_template_match(doc, model_id, entries)
+    if entry is None:
+        return None
+    return {"id": entry["id"], "reason": entry["reason"], "active": False,
+            "supported": not _chat_template_unsupported(env, {})}
 
 
 def _native_chat_template_file(env: dict) -> Path | None:

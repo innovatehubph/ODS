@@ -10469,6 +10469,88 @@ class TestModelProfileRoutes:
         assert handler.parse_response()["activeOperation"] == "model_download"
 
 
+class TestChatTemplateOffer:
+    """WP5: the profile answer names a fixed template only when one matches the model exactly."""
+
+    TEMPLATE = b"{{ messages }}"
+    EMBEDDED = "c" * 64
+
+    def _setup(self, tmp_path, monkeypatch, env_text="GGUF_FILE=running.gguf\n"):
+        install_dir = tmp_path / "install"
+        (install_dir / "data").mkdir(parents=True)
+        (install_dir / ".env").write_text(env_text, encoding="utf-8")
+        vendored = install_dir / "config" / "chat-templates" / "upstream-b9014"
+        vendored.mkdir(parents=True)
+        (vendored / "Fixed.jinja").write_bytes(self.TEMPLATE)
+        entry = {"id": "running-fix", "embeddedTemplateSha256": self.EMBEDDED,
+                 "file": "upstream-b9014/Fixed.jinja", "fileSha256": hashlib.sha256(self.TEMPLATE).hexdigest(),
+                 "builds": ["b11429"], "reason": "Its own template drops tool calls."}
+        (install_dir / "config" / "chat-templates" / "index.json").write_text(
+            json.dumps({"schemaVersion": 1, "overrides": [entry]}), encoding="utf-8")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+        return install_dir
+
+    def _seed(self, install_dir, *, template_sha, source="embedded", build="b11429-x"):
+        store = _mod._model_profile_store
+        path = install_dir / "data" / "model-profiles.json"
+        key = store.profile_key(gguf_sha256=["a" * 64], projector_sha256=None, build_info=build, backend="nvidia",
+                                template_sha256=template_sha, template_source=source, suite="3",
+                                host="0123456789abcdef")
+        profile = store.recorded_profile(key, model_id="running", gguf_file="running.gguf",
+                                         result=TestModelProfileRoutes.RESULT, product_version="t")
+        doc = store.with_profile(store.load(path), profile)
+        store.atomic_write(path, store.with_last_activation(doc, "running", profile["keyHash"]))
+
+    def _get(self):
+        handler = _FakeHandler(b"")
+        handler.path = "/v1/model/profile?model=running"
+        _mod.AgentHandler._handle_model_profile(handler)
+        assert handler.response_code == 200
+        return handler.parse_response()
+
+    def test_an_exact_match_is_offered(self, tmp_path, monkeypatch):
+        install_dir = self._setup(tmp_path, monkeypatch)
+        self._seed(install_dir, template_sha=self.EMBEDDED)
+
+        body = self._get()
+
+        assert body["templateOverride"] == {"id": "running-fix", "reason": "Its own template drops tool calls.",
+                                            "active": False, "supported": True}
+
+    @pytest.mark.parametrize("template_sha, build", [("d" * 64, "b11429-x"), ("c" * 64, "b9014-y"), (None, "b11429-x")])
+    def test_no_exact_match_leaves_the_answer_as_before(self, tmp_path, monkeypatch, template_sha, build):
+        install_dir = self._setup(tmp_path, monkeypatch)
+        self._seed(install_dir, template_sha=template_sha, build=build)
+
+        assert set(self._get()) == {"mode", "modelId", "profile"}
+
+    def test_profiles_off_never_offers_one(self, tmp_path, monkeypatch):
+        install_dir = self._setup(tmp_path, monkeypatch, env_text="ODS_MODEL_PROFILES=off\n")
+        self._seed(install_dir, template_sha=self.EMBEDDED)
+
+        assert "templateOverride" not in self._get()
+
+    def test_a_running_fixed_template_is_reported_as_active(self, tmp_path, monkeypatch):
+        install_dir = self._setup(tmp_path, monkeypatch,
+                                  env_text="GGUF_FILE=running.gguf\nMODEL_CHAT_TEMPLATE_OVERRIDE=running-fix\n")
+        self._seed(install_dir, template_sha=self.EMBEDDED)
+        self._seed(install_dir, template_sha=hashlib.sha256(self.TEMPLATE).hexdigest(), source="override:running-fix")
+
+        body = self._get()
+
+        assert body["profile"]["key"]["templateSource"] == "override:running-fix"
+        assert body["templateOverride"]["active"] is True
+
+    def test_a_windows_runtime_learns_of_the_fix_but_cannot_use_it(self, tmp_path, monkeypatch):
+        install_dir = self._setup(tmp_path, monkeypatch, env_text=(
+            "GPU_BACKEND=amd\nAMD_INFERENCE_RUNTIME_MODE=windows-native-llama-server\nAMD_INFERENCE_LOCATION=host\n"))
+        self._seed(install_dir, template_sha=self.EMBEDDED)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+
+        assert self._get()["templateOverride"]["supported"] is False
+
+
 class TestVisionProjectorFiles:
     """WP2: the projector is downloaded, verified and deleted with the weights."""
 

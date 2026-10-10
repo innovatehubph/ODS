@@ -8190,6 +8190,23 @@ def _write_chat_templates(install_dir, *, embedded_sha=EMBEDDED_TEMPLATE_SHA, bu
     return entry
 
 
+def _seed_template_evidence(install_dir, *, model_id="target-model", template_sha=EMBEDDED_TEMPLATE_SHA,
+                            build="b11429-d81235049", source="embedded", chat=False):
+    """A stored profile measured with ``source``: the evidence an override request is checked against."""
+    store = _mod._model_profile_store
+    path = install_dir / "data" / "model-profiles.json"
+    key = store.profile_key(gguf_sha256=[hashlib.sha256(b"model").hexdigest()], projector_sha256=None,
+                            build_info=build, backend="nvidia", template_sha256=template_sha,
+                            template_source=source, suite="3", host="0123456789abcdef")
+    result = {"suite": "3", "status": "complete", "probes": {"P1": {"status": "pass" if chat else "fail"}},
+              "summary": {"chat": chat, "tools": None}, "facts": {"buildInfo": build}}
+    profile = store.recorded_profile(key, model_id=model_id, gguf_file="new-model.gguf", result=result,
+                                     product_version="test")
+    doc = store.with_profile(store.load(path), profile)
+    store.atomic_write(path, store.with_last_activation(doc, model_id, profile["keyHash"]))
+    return profile
+
+
 def _no_runtime(_env, path, **_kwargs):
     raise OSError(f"no llama-server in this test ({path})")
 
@@ -8376,6 +8393,24 @@ class TestChatTemplateOverrideActivation:
         with pytest.raises(ValueError, match="does not match its recorded SHA-256"):
             _mod._native_chat_template_file({"MODEL_CHAT_TEMPLATE_OVERRIDE": "fixed-model-tools"})
 
+    def test_an_owner_request_with_an_exact_match_runs_the_fixed_template(self, tmp_path, monkeypatch):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path)
+        _write_chat_templates(install_dir)
+        _seed_template_evidence(install_dir)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-agent-key")
+        handler = _ResponseHandler(request_body={"model_id": "target-model",
+                                                 "chat_template_override": "fixed-model-tools"})
+        handler._do_model_activate = lambda *args, **kwargs: _mod.AgentHandler._do_model_activate(
+            handler, *args, **kwargs)
+
+        _mod.AgentHandler._handle_model_activate(handler)
+
+        assert handler.response_code == 200, handler.parse_response()
+        assert handler.parse_response()["chatTemplateOverride"] == "fixed-model-tools"
+        assert _mod.load_env(env_path)["LLAMA_ARG_CHAT_TEMPLATE_FILE"] == (
+            "/chat-templates/upstream-b9014/Fixed-Model.jinja")
+
     def test_an_override_gets_its_own_profile(self, tmp_path, monkeypatch):
         install_dir, *_ = _write_model_activation_fixture(tmp_path)
         entry = _write_chat_templates(install_dir)
@@ -8398,3 +8433,91 @@ class TestChatTemplateOverrideActivation:
         sources = [profile["key"]["templateSource"] for profile in store["profiles"]]
         assert sources == ["embedded", "override:fixed-model-tools"]
         assert store["lastActivation"]["keyHash"] == store["profiles"][-1]["keyHash"]
+
+
+class TestChatTemplateOverrideRequests:
+    """WP5 manual action: the agent runs a fixed template only on an exact match (TEST-PLAN T-U-5 item 1)."""
+
+    def _request(self, tmp_path, monkeypatch, body, *, env_extra=""):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path)
+        if env_extra:
+            env_path.write_text(env_path.read_text(encoding="utf-8") + env_extra, encoding="utf-8")
+        _write_chat_templates(install_dir)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-agent-key")
+        monkeypatch.setattr(_mod, "_begin_model_activation", lambda _model: (True, None))
+        monkeypatch.setattr(_mod, "_end_model_activation", lambda: None)
+        return install_dir
+
+    def _send(self, body):
+        calls = []
+        handler = _ResponseHandler(request_body=body)
+        handler._do_model_activate = lambda model_id, **kwargs: calls.append((model_id, kwargs))
+        _mod.AgentHandler._handle_model_activate(handler)
+        return handler, calls
+
+    def test_an_exact_match_is_forwarded_with_its_index_entry(self, tmp_path, monkeypatch):
+        install_dir = self._request(tmp_path, monkeypatch, None)
+        _seed_template_evidence(install_dir)
+
+        handler, calls = self._send({"model_id": "target-model", "chat_template_override": "fixed-model-tools"})
+
+        assert handler.response_code is None
+        ((model_id, kwargs),) = calls
+        assert model_id == "target-model" and kwargs["template_override"]["id"] == "fixed-model-tools"
+
+    @pytest.mark.parametrize("evidence, code", [
+        (None, "chat_template_override_not_matched"),
+        ({"template_sha": "e" * 63 + "f"}, "chat_template_override_not_matched"),
+        ({"build": "b8210-1234567"}, "chat_template_override_not_matched"),
+        ({"build": None}, "chat_template_override_not_matched"),
+        ({"source": "override:fixed-model-tools", "chat": True}, "chat_template_override_not_matched"),
+        ({"model_id": "other-model"}, "chat_template_override_not_matched"),
+    ])
+    def test_anything_but_an_exact_match_is_refused(self, tmp_path, monkeypatch, evidence, code):
+        install_dir = self._request(tmp_path, monkeypatch, None)
+        if evidence is not None:
+            _seed_template_evidence(install_dir, **evidence)
+
+        handler, calls = self._send({"model_id": "target-model", "chat_template_override": "fixed-model-tools"})
+
+        assert handler.response_code == 409 and calls == []
+        response = handler.parse_response()
+        assert response["code"] == code and "Nothing was changed" in response["error"]
+
+    def test_the_newest_measurement_with_the_models_own_template_decides(self, tmp_path, monkeypatch):
+        install_dir = self._request(tmp_path, monkeypatch, None)
+        _seed_template_evidence(install_dir)
+        _seed_template_evidence(install_dir, template_sha="d" * 64, build="b9014-ad4b5c5f")
+
+        handler, calls = self._send({"model_id": "target-model", "chat_template_override": "fixed-model-tools"})
+
+        assert handler.response_code == 409 and calls == []
+
+    def test_an_unknown_template_or_profiles_off_is_refused(self, tmp_path, monkeypatch):
+        install_dir = self._request(tmp_path, monkeypatch, None)
+        _seed_template_evidence(install_dir)
+        handler, calls = self._send({"model_id": "target-model", "chat_template_override": "no-such-fix"})
+        assert handler.response_code == 409 and calls == []
+        assert handler.parse_response()["code"] == "chat_template_override_unknown"
+
+        env_path = install_dir / ".env"
+        env_path.write_text(env_path.read_text(encoding="utf-8") + "ODS_MODEL_PROFILES=off\n", encoding="utf-8")
+        handler, calls = self._send({"model_id": "target-model", "chat_template_override": "fixed-model-tools"})
+        assert handler.response_code == 409 and calls == []
+        assert handler.parse_response()["code"] == "profiles_off"
+
+    @pytest.mark.parametrize("value", [7, "", "Fixed Model", "../fixed-model-tools", "x" * 65, ["fixed-model-tools"]])
+    def test_a_malformed_template_id_is_a_bad_request(self, tmp_path, monkeypatch, value):
+        self._request(tmp_path, monkeypatch, None)
+
+        handler, calls = self._send({"model_id": "target-model", "chat_template_override": value})
+
+        assert handler.response_code == 400 and calls == []
+
+    def test_a_request_without_the_field_is_forwarded_as_before(self, tmp_path, monkeypatch):
+        self._request(tmp_path, monkeypatch, None)
+
+        _handler, calls = self._send({"model_id": "target-model"})
+
+        assert calls == [("target-model", {})]
