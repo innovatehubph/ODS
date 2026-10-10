@@ -290,8 +290,12 @@ llama.cpp for templates it knows to be broken (`config/chat-templates/`,
 reviewed like code and checked by SHA-256). When the check shows that the
 running model's own template is exactly one of them, the Models page offers
 **Try a fixed template**: ODS restarts the model with the fixed template and
-checks it again. A later switch clears it. Templates are never downloaded
-while ODS runs. The Windows model runtimes cannot use a fixed template yet.
+checks it again. A later switch clears it. With `ODS_MODEL_PROFILES=enabled`,
+ODS tries the fixed template by itself when the model does not answer the
+first check: it keeps the fixed template if the model then answers, and
+otherwise returns to the model's own template, all within the same two-minute
+check. Templates are never downloaded while ODS runs. The Windows model
+runtimes cannot use a fixed template yet.
 
 ### Choosing the runtime context
 

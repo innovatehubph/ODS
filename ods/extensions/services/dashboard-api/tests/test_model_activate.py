@@ -8521,3 +8521,240 @@ class TestChatTemplateOverrideRequests:
         _handler, calls = self._send({"model_id": "target-model"})
 
         assert calls == [("target-model", {})]
+
+
+EMBEDDED_TEMPLATE = "{% for m in messages %}{{ m.content }}{% endfor %}{% if tools %}<tools>{% endif %}"
+
+
+class TestAutomaticTemplateRetry:
+    """WP5.3 (TEST-PLAN T-U-4/T-U-5 item 4): with profiles enabled, a model that fails the chat
+    check with its own template, which the index fixes exactly, is retried once with the fix."""
+
+    @pytest.fixture(autouse=True)
+    def _quiet_runtime(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_chat_completion_ready", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(_mod, "_runtime_health", lambda _env: "ok")
+        monkeypatch.setattr(_mod, "_llama_runtime_props", lambda _env: (131072, ""))
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_container_exists", lambda _container: False)
+        monkeypatch.setattr(_mod, "_container_running", lambda _container: False)
+        monkeypatch.setattr(_mod, "_verify_hermes_dashboard_ready", lambda: None)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", _mock_verified_readiness)
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+
+    def _install(self, tmp_path, monkeypatch, *, mode="enabled", index=True):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path)
+        if mode:
+            env_path.write_text(env_path.read_text(encoding="utf-8") + f"ODS_MODEL_PROFILES={mode}\n",
+                                encoding="utf-8")
+        entry = _write_chat_templates(install_dir, embedded_sha=hashlib.sha256(EMBEDDED_TEMPLATE.encode()).hexdigest(),
+                                      builds=("b11429",))
+        if not index:
+            (install_dir / "config" / "chat-templates" / "index.json").write_text(
+                json.dumps({"schemaVersion": 1, "overrides": []}), encoding="utf-8")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        restarts = []
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda env: restarts.append(
+            _mod.load_env(install_dir / ".env").get("MODEL_CHAT_TEMPLATE_OVERRIDE")))
+        return install_dir, env_path, entry, restarts
+
+    def _runtime(self, monkeypatch, *, fixed_answers=True, order=None):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_model_profile_probes as scripted
+
+        runtimes = {False: scripted.Runtime(ready=scripted._completion("Hello there")),
+                    True: scripted.Runtime() if fixed_answers else scripted.Runtime(
+                        ready=scripted._completion("Hello there"))}
+        props = dict(TestModelProfileInActivation.PROPS)
+
+        def exchange(env, path, *, payload=None, timeout=30):
+            fixed = bool(env.get("MODEL_CHAT_TEMPLATE_OVERRIDE"))
+            if order is not None:
+                order.append((path, fixed))
+            if path == "/props":
+                return 200, json.dumps({**props, "chat_template": FIXED_TEMPLATE.decode() if fixed else EMBEDDED_TEMPLATE})
+            return runtimes[fixed](path, payload, timeout)
+
+        monkeypatch.setattr(_mod, "_runtime_exchange", exchange)
+
+    def _activate(self, **options):
+        handler = _ResponseHandler()
+        _mod.AgentHandler._do_model_activate(handler, "target-model", **options)
+        return handler
+
+    @staticmethod
+    def _store(install_dir):
+        return json.loads((install_dir / "data" / "model-profiles.json").read_text(encoding="utf-8"))
+
+    def test_a_fixed_template_that_answers_is_kept_and_recorded(self, tmp_path, monkeypatch):
+        install_dir, env_path, entry, restarts = self._install(tmp_path, monkeypatch)
+        order = []
+        self._runtime(monkeypatch, order=order)
+        real_render = _mod._render_model_router_runtime_configs
+        monkeypatch.setattr(_mod, "_render_model_router_runtime_configs",
+                            lambda *a, **k: order.append(("consumers", None)) or real_render(*a, **k))
+
+        handler = self._activate()
+
+        assert handler.response_code == 200, handler.parse_response()
+        profile = handler.parse_response()["profile"]
+        assert profile["templateRetry"] == {"id": entry["id"], "outcome": "kept"}
+        assert profile["summary"]["chat"] is True
+        assert restarts == [None, entry["id"]]
+        persisted = _mod.load_env(env_path)
+        assert persisted["MODEL_CHAT_TEMPLATE_OVERRIDE"] == entry["id"]
+        assert persisted["LLAMA_ARG_CHAT_TEMPLATE_FILE"] == "/chat-templates/upstream-b9014/Fixed-Model.jinja"
+        store = self._store(install_dir)
+        assert [p["key"]["templateSource"] for p in store["profiles"]] == ["embedded", f"override:{entry['id']}"]
+        assert store["lastActivation"]["keyHash"] == store["profiles"][-1]["keyHash"] == profile["keyHash"]
+        # Consumers are touched once, after the variant that stays was measured.
+        last_fixed_probe = max(i for i, (path, fixed) in enumerate(order) if fixed and path != "consumers")
+        assert order.index(("consumers", None)) > last_fixed_probe
+
+    def test_a_fix_that_does_not_answer_either_returns_to_the_models_own_template(self, tmp_path, monkeypatch):
+        install_dir, env_path, entry, restarts = self._install(tmp_path, monkeypatch)
+        self._runtime(monkeypatch, fixed_answers=False)
+
+        handler = self._activate()
+
+        assert handler.response_code == 200, handler.parse_response()
+        profile = handler.parse_response()["profile"]
+        assert profile["templateRetry"] == {"id": entry["id"], "outcome": "reverted", "fixedTemplateChat": False}
+        assert restarts == [None, entry["id"], None]
+        text = env_path.read_text(encoding="utf-8")
+        assert "MODEL_CHAT_TEMPLATE_OVERRIDE" not in text and "LLAMA_ARG_CHAT_TEMPLATE_FILE" not in text
+        store = self._store(install_dir)
+        embedded = next(p for p in store["profiles"] if p["key"]["templateSource"] == "embedded")
+        assert store["lastActivation"]["keyHash"] == embedded["keyHash"] == profile["keyHash"]
+
+    def test_a_fix_that_does_not_load_is_undone_from_a_clean_readiness_diagnosis(self, tmp_path, monkeypatch):
+        _install_dir, env_path, entry, restarts = self._install(tmp_path, monkeypatch)
+        self._runtime(monkeypatch)
+        waits = []
+
+        def readiness(*args, **kwargs):
+            diagnosis = kwargs.get("diagnosis")
+            if diagnosis is not None:
+                waits.append(dict(diagnosis))
+                if len(waits) == 2:  # the fixed template's start
+                    diagnosis.update(final=True, reason="failed to open the template")
+                    return {}
+            return _mock_verified_readiness(*args, **kwargs)
+
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", readiness)
+
+        handler = self._activate()
+
+        assert handler.response_code == 200, handler.parse_response()
+        retry = handler.parse_response()["profile"]["templateRetry"]
+        assert retry["outcome"] == "reverted" and "failure" in retry
+        assert restarts == [None, entry["id"], None]
+        # The third wait starts clean: a stale "final" would end it before it probes.
+        assert waits[2] == {}
+        assert "MODEL_CHAT_TEMPLATE_OVERRIDE" not in env_path.read_text(encoding="utf-8")
+
+    def test_a_failed_return_to_the_models_own_template_rolls_the_switch_back(self, tmp_path, monkeypatch):
+        _install_dir, env_path, entry, restarts = self._install(tmp_path, monkeypatch)
+        env_before = env_path.read_text(encoding="utf-8")
+        self._runtime(monkeypatch)
+        waits = []
+
+        def readiness(*args, **kwargs):
+            if kwargs.get("diagnosis") is not None:
+                waits.append(kwargs["gguf_file"])
+                if len(waits) in (2, 3):
+                    kwargs["diagnosis"]["reason"] = "llama-server did not start"
+                    return {}
+            return _mock_verified_readiness(*args, **kwargs)
+
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", readiness)
+
+        handler = self._activate()
+
+        assert handler.response_code == 500
+        response = handler.parse_response()
+        assert response["rolled_back"] is True
+        assert "did not restart with its own chat template" in response["error"]
+        assert restarts == [None, entry["id"], None, None]  # the last restart brings back the previous model
+        assert env_path.read_text(encoding="utf-8") == env_before
+
+    def test_the_retry_shares_the_one_profiling_budget(self, tmp_path, monkeypatch):
+        self._install(tmp_path, monkeypatch)
+        self._runtime(monkeypatch)
+        budgets = []
+        real_battery = _mod._model_profile_probes.run_battery
+
+        def battery(exchange, props, **kwargs):
+            budgets.append(kwargs["budget_seconds"])
+            return real_battery(exchange, props, **kwargs)
+
+        monkeypatch.setattr(_mod._model_profile_probes, "run_battery", battery)
+
+        assert self._activate().response_code == 200
+
+        assert budgets[0] == _mod._model_profile_probes.BUDGET_SECONDS
+        assert 0 < budgets[1] <= _mod._model_profile_probes.BUDGET_SECONDS
+        assert budgets[0] + budgets[1] <= 2 * _mod._model_profile_probes.BUDGET_SECONDS
+
+    def test_no_retry_without_time_left_in_the_budget(self, tmp_path, monkeypatch):
+        _install_dir, env_path, entry, restarts = self._install(tmp_path, monkeypatch)
+        self._runtime(monkeypatch)
+        monkeypatch.setattr(_mod._model_profile_probes, "BUDGET_SECONDS", 20.0)
+
+        handler = self._activate()
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["profile"]["templateRetry"] == {
+            "id": entry["id"], "outcome": "skipped", "reason": "budget"}
+        assert restarts == [None]
+        assert "MODEL_CHAT_TEMPLATE_OVERRIDE" not in env_path.read_text(encoding="utf-8")
+
+    def test_the_next_switch_reuses_both_profiles(self, tmp_path, monkeypatch):
+        _install_dir, _env_path, entry, restarts = self._install(tmp_path, monkeypatch)
+        self._runtime(monkeypatch)
+        assert self._activate().response_code == 200
+        order = []
+        self._runtime(monkeypatch, order=order)
+
+        handler = self._activate()
+
+        assert handler.parse_response()["profile"]["status"] == "cached"
+        assert handler.parse_response()["profile"]["templateRetry"]["outcome"] == "kept"
+        assert restarts == [None, entry["id"], None, entry["id"]]
+        assert [path for path, _fixed in order if path != "/props"] == []
+
+    def test_an_owners_fixed_template_is_never_retried(self, tmp_path, monkeypatch):
+        _install_dir, _env_path, entry, restarts = self._install(tmp_path, monkeypatch)
+        self._runtime(monkeypatch, fixed_answers=False)
+
+        handler = self._activate(template_override=entry)
+
+        assert handler.response_code == 200
+        assert "templateRetry" not in handler.parse_response()["profile"]
+        assert restarts == [entry["id"]]
+
+    @pytest.mark.parametrize("mode", ["observe", "off", None])
+    def test_observe_and_off_activate_exactly_as_without_an_index_match(self, tmp_path, monkeypatch, mode):
+        """The golden rule (PLAN D5): outside enabled, a match changes no written byte and no answer."""
+        results = []
+        for index in (True, False):
+            shutil.rmtree(tmp_path / "install", ignore_errors=True)
+            install_dir, env_path, _entry, restarts = self._install(tmp_path, monkeypatch, mode=mode, index=index)
+            self._runtime(monkeypatch)
+
+            handler = self._activate()
+
+            assert handler.response_code == 200
+            assert restarts == [None]
+            store_path = install_dir / "data" / "model-profiles.json"
+            store = json.loads(store_path.read_text(encoding="utf-8")) if store_path.exists() else None
+            if store is not None:
+                for profile in store["profiles"]:
+                    profile.pop("recordedAt")
+                    profile["result"].pop("elapsedMs")
+                    for probe in profile["result"]["probes"].values():
+                        probe.pop("ms")
+            results.append((env_path.read_bytes(), handler.parse_response(), store))
+
+        assert results[0] == results[1]
+        assert "templateRetry" not in json.dumps(results[0][1])

@@ -14482,6 +14482,63 @@ class AgentHandler(BaseHTTPRequestHandler):
                 _record_model_activation_result('rollback_unconfirmed', 'rollback_unconfirmed')
                 return False, str(rollback_exc)
 
+        def restart_with_template(entry: dict | None) -> dict:
+            """Restart the staged model with ``entry`` or its own template (WP5.3).
+
+            The .env snapshot taken before the first write stays the rollback
+            point. Each wait starts from a clean diagnosis: a "final" left by
+            an earlier wait would end the next one before it probes.
+            """
+            nonlocal runtime_stage_started
+            updates, removals = _chat_template_env_changes(entry, container=gpu_backend != "apple")
+            _write_bound_env_text(env_path, _env_text_with_changes(
+                env_path.read_text(encoding="utf-8").splitlines(), updates, removals))
+            readiness_diagnosis.clear()
+            _set_model_activation_phase('loading')
+            runtime_stage_started = time.time()
+            return _switchboard_reconciler.run_runtime_activation(switchboard_adapter, load_env(env_path))
+
+        def retry_with_fixed_template(entry: dict, first: dict, profiled_seconds: float) -> tuple[dict, dict]:
+            """WP5.3 automatic retry (enabled only, D3): run the model once with the fixed
+            template that matches its own exactly, keep it when it answers the chat
+            check, else return to the model's own template. Both probe runs share
+            the one D2 budget. Returns the env and profile status of what stays loaded.
+            """
+            nonlocal switchboard_run, healthy
+            budget = _model_profile_probes.BUDGET_SECONDS - profiled_seconds
+            if budget < _TEMPLATE_RETRY_MIN_BUDGET_SECONDS:
+                logger.info("No time left in the profiling budget to try fixed chat template %s", entry["id"])
+                return load_env(env_path), {**first, "templateRetry": {
+                    "id": entry["id"], "outcome": "skipped", "reason": "budget"}}
+            logger.info("%s did not answer the chat check; trying fixed chat template %s", model_id, entry["id"])
+            outcome = {"id": entry["id"]}
+            retried_run = restart_with_template(entry)
+            if retried_run["ok"]:
+                switchboard_run = retried_run
+                retried_env = load_env(env_path)
+                probing_started = time.monotonic()
+                retried = _profile_model_advisory(retried_env, model, model_id=model_id, gguf_file=gguf_file,
+                                                  budget_seconds=budget)
+                budget -= time.monotonic() - probing_started
+                if (retried.get("summary") or {}).get("chat") is True:
+                    return retried_env, {**retried, "templateRetry": {**outcome, "outcome": "kept"}}
+                outcome["fixedTemplateChat"] = (retried.get("summary") or {}).get("chat")
+            else:
+                outcome["failure"] = str(retried_run.get("detail") or retried_run.get("phase") or "")[:200]
+            own_run = restart_with_template(None)
+            switchboard_run = own_run
+            if not own_run["ok"]:
+                healthy = False
+                raise RuntimeError(
+                    f"{gguf_file} did not restart with its own chat template after a fixed template was tried: "
+                    f"{own_run.get('detail') or own_run.get('phase')}")
+            own_env = load_env(env_path)
+            # Normally a cache hit that puts lastActivation back on the model's
+            # own profile; it never probes beyond the shared budget.
+            own = _profile_model_advisory(own_env, model, model_id=model_id, gguf_file=gguf_file,
+                                          budget_seconds=max(budget, 0.0))
+            return own_env, {**own, "templateRetry": {**outcome, "outcome": "reverted"}}
+
         try:
             # Read current env BEFORE modification — needed for gpu_backend guard
             env_pre = load_env(env_path)
@@ -14759,21 +14816,7 @@ class AgentHandler(BaseHTTPRequestHandler):
                     template_override, container=not host_native_llama and gpu_backend != "apple")
                 updates.update(template_updates)
                 remove_keys.update(template_removals)
-                new_lines = []
-                seen = set()
-                for line in lines:
-                    key = line.split("=", 1)[0] if "=" in line and not line.startswith("#") else None
-                    if key and key in updates:
-                        new_lines.append(_env_assignment(key, str(updates[key])))
-                        seen.add(key)
-                    elif key and key in remove_keys:
-                        continue
-                    else:
-                        new_lines.append(line)
-                for key, val in updates.items():
-                    if key not in seen:
-                        new_lines.append(_env_assignment(key, str(val)))
-                _write_bound_env_text(env_path, "\n".join(new_lines) + "\n")
+                _write_bound_env_text(env_path, _env_text_with_changes(lines, updates, remove_keys))
 
             # Update models.ini
             models_ini.parent.mkdir(parents=True, exist_ok=True)
@@ -14985,10 +15028,21 @@ class AgentHandler(BaseHTTPRequestHandler):
             if healthy:
                 # WP3: measure what the new model can do before any consumer
                 # is touched (first switch per file x build x host only).
+                profiling_started = time.monotonic()
                 model_profile_status = _profile_model_advisory(
                     env, model, model_id=model_id, gguf_file=gguf_file)
-                # WP4 (enabled only): the measured traits replace the catalog
-                # booleans for every reader of this switch's route record.
+                # WP5.3: a model that fails the chat check with its own
+                # template, which ODS fixes exactly, gets one retry with the
+                # fixed template (ODS_MODEL_PROFILES=enabled only).
+                retry_template = (
+                    _template_retry_entry(env, model_profile_status)
+                    if template_override is None and switchboard_adapter is not None
+                    and runtime_restart_strategy in _TEMPLATE_RETRY_STRATEGIES else None)
+                if retry_template is not None:
+                    env, model_profile_status = retry_with_fixed_template(
+                        retry_template, model_profile_status, time.monotonic() - profiling_started)
+                # WP4 (enabled only): the measured traits of what stays loaded
+                # replace the catalog booleans for every reader of the route.
                 profile_traits = _profile_traits(env, model_profile_status)
                 if switchboard_run is not None and profile_traits is not None:
                     switchboard_run["capabilities"] = _profiled_capabilities(
@@ -15779,6 +15833,25 @@ _CHAT_TEMPLATE_FILE_KEY = "LLAMA_ARG_CHAT_TEMPLATE_FILE"
 _CHAT_TEMPLATE_CONTAINER_DIR = "/chat-templates"
 
 
+def _env_text_with_changes(lines: list[str], updates: dict, remove_keys: set) -> str:
+    """``.env`` text from ``lines``: ``updates`` set in place (appended when new), ``remove_keys`` dropped."""
+    new_lines = []
+    seen = set()
+    for line in lines:
+        key = line.split("=", 1)[0] if "=" in line and not line.startswith("#") else None
+        if key and key in updates:
+            new_lines.append(_env_assignment(key, str(updates[key])))
+            seen.add(key)
+        elif key and key in remove_keys:
+            continue
+        else:
+            new_lines.append(line)
+    for key, val in updates.items():
+        if key not in seen:
+            new_lines.append(_env_assignment(key, str(val)))
+    return "\n".join(new_lines) + "\n"
+
+
 def _chat_template_root() -> Path:
     return INSTALL_DIR / "config" / "chat-templates"
 
@@ -15905,6 +15978,41 @@ def _chat_template_offer(env: dict, doc: dict, model_id: str, profile: dict | No
             "supported": not _chat_template_unsupported(env, {})}
 
 
+# The automatic retry (WP5.3) restarts the runtime the activation itself
+# staged; the Windows runtimes have no template input (see above).
+_TEMPLATE_RETRY_STRATEGIES = frozenset({"compose-llama", "container-llama", "macos-native-llama"})
+# A retry starts only with time for at least the chat probe (P1) left in the
+# one profiling budget (PLAN D2) that both variants share.
+_TEMPLATE_RETRY_MIN_BUDGET_SECONDS = 30.0
+
+
+def _template_retry_entry(env: dict, status: dict) -> dict | None:
+    """The fixed template to retry a first switch with, or None (PLAN D3, WP5.3).
+
+    Only with ODS_MODEL_PROFILES=enabled, only when the profile just used
+    shows the model failing the chat check (P1) with its own template, and
+    only when the index fixes exactly that template on this llama.cpp build.
+    """
+    if (_model_profiles_mode(env) != "enabled" or _model_profile_templates is None
+            or status.get("status") not in {"recorded", "cached"}
+            or (status.get("summary") or {}).get("chat") is not False):
+        return None
+    doc = _model_profile_doc()
+    profile = next((entry for entry in doc["profiles"] if entry["keyHash"] == status.get("keyHash")), None)
+    if profile is None or profile["key"]["templateSource"] != "embedded":
+        return None
+    entry = _model_profile_templates.match(
+        _chat_template_overrides(), profile["key"]["templateSha256"], profile["key"]["buildInfo"])
+    if entry is None:
+        return None
+    try:
+        _model_profile_templates.template_path(_chat_template_root(), entry)
+    except (OSError, _model_profile_templates.TemplateIndexError) as exc:
+        logger.warning("Fixed chat template %s cannot be tried: %s", entry["id"], exc)
+        return None
+    return entry
+
+
 def _native_chat_template_file(env: dict) -> Path | None:
     """The fixed template a native launch passes as --chat-template-file, proven by its SHA-256."""
     override_id = _active_chat_template_override(env)
@@ -15918,12 +16026,14 @@ def _native_chat_template_file(env: dict) -> Path | None:
     return _model_profile_templates.template_path(_chat_template_root(), entry)
 
 
-def _profile_model(env: dict, model: dict, *, model_id: str, gguf_file: str, force: bool = False) -> dict:
+def _profile_model(env: dict, model: dict, *, model_id: str, gguf_file: str, force: bool = False,
+                   budget_seconds: float | None = None) -> dict:
     """Measure the loaded model once per GGUF x llama.cpp build x host (PLAN WP3).
 
     A stored profile with the same key is reused unless ``force``. Inside an
     activation this runs after the runtime proof and before any consumer is
     touched (D1), under one total budget (D2), shown as the "profiling" phase.
+    ``budget_seconds`` is what is left of that budget for a template retry.
     """
     if _model_profiles_mode(env) == "off" or _model_profile_probes is None or _model_profile_store is None:
         return {"status": "off"}
@@ -15962,6 +16072,7 @@ def _profile_model(env: dict, model: dict, *, model_id: str, gguf_file: str, for
             lambda probe_path, probe_payload, probe_timeout: _runtime_exchange(
                 env, probe_path, payload=probe_payload, timeout=probe_timeout),
             props,
+            budget_seconds=_model_profile_probes.BUDGET_SECONDS if budget_seconds is None else budget_seconds,
         )
         profile = _model_profile_store.recorded_profile(
             key, model_id=model_id, gguf_file=gguf_file, result=result, product_version=ODS_VERSION)
@@ -15974,14 +16085,16 @@ def _profile_model(env: dict, model: dict, *, model_id: str, gguf_file: str, for
             "summary": profile["result"]["summary"]}
 
 
-def _profile_model_advisory(env: dict, model: dict, *, model_id: str, gguf_file: str, force: bool = False) -> dict:
+def _profile_model_advisory(env: dict, model: dict, *, model_id: str, gguf_file: str, force: bool = False,
+                            budget_seconds: float | None = None) -> dict:
     """``_profile_model`` that can never fail a switch (PLAN D4, the no-lockout rule).
 
     These are the I/O and response-shape failures a probe run can meet; each
     is logged with its trace and reported as the profile's status instead.
     """
     try:
-        return _profile_model(env, model, model_id=model_id, gguf_file=gguf_file, force=force)
+        return _profile_model(env, model, model_id=model_id, gguf_file=gguf_file, force=force,
+                              budget_seconds=budget_seconds)
     except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
         logger.exception("Model profile for %s did not complete", model_id)
         return {"status": "error", "reason": type(exc).__name__}
