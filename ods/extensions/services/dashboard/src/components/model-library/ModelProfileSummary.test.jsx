@@ -63,6 +63,26 @@ test('a model not measured yet says when it will be', async () => {
   expect(screen.getByText(/Not checked yet/)).toBeVisible()
 })
 
+test('a running model never checked can be checked from its card', async () => {
+  // The Portal advisory for a model ODS has not checked points here.
+  profileBody.profile = null
+  await show()
+  profileBody.profile = profile(capable)
+  await act(async () => { fireEvent.click(screen.getByRole('button', {name: 'Check again'})) })
+  expect(fetch).toHaveBeenCalledWith('/api/models/qwen3.5-9b/profile/recheck', {method: 'POST'})
+  await waitFor(() => expect(screen.getByRole('region', {name: 'What this model can do'}))
+    .toHaveTextContent('Calls tools (Pixel and agents)'))
+})
+
+test('a refused first check is shown in words', async () => {
+  profileBody.profile = null
+  recheckResponse = {ok: false, status: 409, body: {detail: {error: 'Only the running model can be checked; run it first'}}}
+  await show()
+  await act(async () => { fireEvent.click(screen.getByRole('button', {name: 'Check again'})) })
+  await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Only the running model can be checked'))
+  expect(screen.getByText(/Not checked yet/)).toBeVisible()
+})
+
 test('nothing shows when profiles are off or the check is unavailable', async () => {
   profileBody = {mode: 'off', modelId: 'qwen3.5-9b', profile: null}
   const {container} = render(<ModelProfileSummary modelId="qwen3.5-9b"/>)

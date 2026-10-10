@@ -74,12 +74,27 @@ export default function ModelProfileSummary({modelId}) {
   }
 
   if (!modelId || failed || !data || data.mode === 'off') return null
+  const recheckButton = (
+    <button
+      type="button"
+      onClick={recheck}
+      disabled={rechecking}
+      className="inline-flex items-center gap-1 rounded border border-theme-border px-2 py-0.5 text-theme-text-secondary hover:text-theme-text disabled:opacity-50"
+    >
+      {rechecking ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+      {rechecking ? 'Checking…' : 'Check again'}
+    </button>
+  )
   const profile = data.profile
   if (!profile) {
+    // A model running since before checks existed has no profile yet. The
+    // Portal advisory sends the owner here to press Check again.
     return (
-      <p className="mt-2 text-[11px] text-theme-text-muted">
-        Not checked yet: ODS checks what a model can do the first time it runs on this machine.
-      </p>
+      <div className="mt-2 space-y-1.5 text-[11px] text-theme-text-muted">
+        <p>Not checked yet: ODS checks what a model can do the first time it runs on this machine.</p>
+        {recheckButton}
+        {notice && <p role="status" className="text-amber-200">{notice}</p>}
+      </div>
     )
   }
   const summary = profile.result?.summary || {}
@@ -100,15 +115,7 @@ export default function ModelProfileSummary({modelId}) {
           {facts.buildInfo ? ` on llama.cpp ${String(facts.buildInfo).split('-')[0]}` : ''}
           {profile.result?.status === 'partial' ? '; some checks ran out of time' : ''}.
         </span>
-        <button
-          type="button"
-          onClick={recheck}
-          disabled={rechecking}
-          className="inline-flex items-center gap-1 rounded border border-theme-border px-2 py-0.5 text-theme-text-secondary hover:text-theme-text disabled:opacity-50"
-        >
-          {rechecking ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
-          {rechecking ? 'Checking…' : 'Check again'}
-        </button>
+        {recheckButton}
         {hasWarning && <HelpLink className="text-[11px]" />}
       </div>
       {notice && <p role="status" className="text-amber-200">{notice}</p>}
