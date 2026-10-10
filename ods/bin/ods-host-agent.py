@@ -59,10 +59,12 @@ try:
     import model_profile as _model_profile
     from model_profile import probes as _model_profile_probes
     from model_profile import store as _model_profile_store
+    from model_profile import templates as _model_profile_templates
 except ImportError:  # pragma: no cover - import environment dependent
     _model_profile = None
     _model_profile_probes = None
     _model_profile_store = None
+    _model_profile_templates = None
 
 try:
     from model_switchboard import state as _switchboard_state
@@ -13875,8 +13877,13 @@ class AgentHandler(BaseHTTPRequestHandler):
         *,
         requested_context_length: int | None = None,
         requested_tier: str | None = None,
+        template_override: dict | None = None,
     ):
-        """Inner activate logic — called with _model_activate_lock held."""
+        """Inner activate logic — called with _model_activate_lock held.
+
+        ``template_override`` is a validated chat-template index entry (WP5):
+        the model runs with that fixed template instead of its own.
+        """
         env_path = INSTALL_DIR / ".env"
         if not env_path.exists():
             json_response(
@@ -14089,6 +14096,14 @@ class AgentHandler(BaseHTTPRequestHandler):
         except (ValueError, OSError, subprocess.SubprocessError) as exc:
             json_response(self, 400, {"error": str(exc)})
             return
+
+        if template_override is not None:
+            # A fixed chat template (WP5) is refused before anything changes
+            # where it cannot be loaded, never silently dropped.
+            refusal = _chat_template_refusal(persisted_env, wsl_managed, template_override)
+            if refusal is not None:
+                json_response(self, 409, {**refusal, "requestedModelId": model_id})
+                return
 
         tier_context_limit: int | None = None
         if requested_tier is not None:
@@ -14716,6 +14731,14 @@ class AgentHandler(BaseHTTPRequestHandler):
                     updates["LLAMA_ARG_MMPROJ"] = f"/models/{projector_file.name}"
                 else:
                     remove_keys.add("LLAMA_ARG_MMPROJ")
+                # A fixed chat template (WP5) for an exact template match; any
+                # other model clears the previous one's. The container reads
+                # it from its read-only /chat-templates mount; native macOS
+                # takes it as an argument (_launch_native_llama_server).
+                template_updates, template_removals = _chat_template_env_changes(
+                    template_override, container=not host_native_llama and gpu_backend != "apple")
+                updates.update(template_updates)
+                remove_keys.update(template_removals)
                 new_lines = []
                 seen = set()
                 for line in lines:
@@ -15724,6 +15747,91 @@ def _model_profile_digests(model: dict, gguf_file: str) -> list[str]:
     return digests or [f"file:{gguf_file}"]
 
 
+# Fixed chat templates (WP5). An activation for an exact template match sets
+# both keys; every other activation removes them (the WP0.1 rule). The
+# override id is the record every runtime reads (the profile key, the native
+# macOS launch); the file path is what the llama-server container loads from
+# its read-only /chat-templates mount.
+_CHAT_TEMPLATE_OVERRIDE_KEY = "MODEL_CHAT_TEMPLATE_OVERRIDE"
+_CHAT_TEMPLATE_FILE_KEY = "LLAMA_ARG_CHAT_TEMPLATE_FILE"
+_CHAT_TEMPLATE_CONTAINER_DIR = "/chat-templates"
+
+
+def _chat_template_root() -> Path:
+    return INSTALL_DIR / "config" / "chat-templates"
+
+
+def _chat_template_overrides() -> list[dict]:
+    """The curated override index; none when it is missing or malformed (logged)."""
+    if _model_profile_templates is None:
+        return []
+    try:
+        return _model_profile_templates.load_index(_chat_template_root())
+    except (OSError, UnicodeError, _model_profile_templates.TemplateIndexError) as exc:
+        logger.warning("Chat template index unavailable; no fixed template is offered: %s", exc)
+        return []
+
+
+def _active_chat_template_override(env: dict) -> str | None:
+    """The fixed template id the configured model runs with, if any."""
+    return str(env.get(_CHAT_TEMPLATE_OVERRIDE_KEY) or "").strip() or None
+
+
+def _chat_template_env_changes(entry: dict | None, *, container: bool) -> tuple[dict, set]:
+    """The .env updates and removals that run the next model with ``entry``, or with its own template."""
+    if entry is None:
+        return {}, {_CHAT_TEMPLATE_OVERRIDE_KEY, _CHAT_TEMPLATE_FILE_KEY}
+    updates = {_CHAT_TEMPLATE_OVERRIDE_KEY: entry["id"]}
+    if container:
+        updates[_CHAT_TEMPLATE_FILE_KEY] = f"{_CHAT_TEMPLATE_CONTAINER_DIR}/{entry['file']}"
+        return updates, set()
+    return updates, {_CHAT_TEMPLATE_FILE_KEY}
+
+
+def _chat_template_unsupported(env: dict, wsl_managed: dict) -> bool:
+    """Windows runtimes (the WSL Portal's llama-server.exe and the legacy Docker
+    Desktop launch) have no fixed-template input yet; they refuse an override."""
+    return (wsl_managed.get("managed") is True or _runtime_uses_router_transport(env)
+            or _is_windows_host_llama_server(env))
+
+
+def _chat_template_refusal(env: dict, wsl_managed: dict, entry: dict) -> dict | None:
+    """Why the next model cannot run with the fixed template ``entry``, or None.
+
+    Checked before an activation changes anything: the runtime must be able
+    to load a template file, and the vendored file must still have the
+    SHA-256 its index entry records.
+    """
+    if _chat_template_unsupported(env, wsl_managed):
+        return {"error": "The Windows model runtime on this machine cannot use a fixed chat template yet. "
+                         "Nothing was changed.",
+                "code": "chat_template_override_unsupported"}
+    if _model_profile_templates is None:
+        return {"error": "This installation is missing its chat template support files. Nothing was changed; "
+                         "run the installer again to restore them.",
+                "code": "chat_template_override_unavailable"}
+    try:
+        _model_profile_templates.template_path(_chat_template_root(), entry)
+    except (OSError, _model_profile_templates.TemplateIndexError) as exc:
+        return {"error": f"The fixed chat template cannot be used: {exc}. Nothing was changed; "
+                         "run the installer again to restore the template files.",
+                "code": "chat_template_override_unavailable"}
+    return None
+
+
+def _native_chat_template_file(env: dict) -> Path | None:
+    """The fixed template a native launch passes as --chat-template-file, proven by its SHA-256."""
+    override_id = _active_chat_template_override(env)
+    if override_id is None:
+        return None
+    if _model_profile_templates is None:
+        raise RuntimeError("Fixed chat templates need the model_profile package; re-run the installer")
+    entry = _model_profile_templates.entry_by_id(_chat_template_overrides(), override_id)
+    if entry is None:
+        raise RuntimeError(f"The fixed chat template {override_id} is not in this installation's template index")
+    return _model_profile_templates.template_path(_chat_template_root(), entry)
+
+
 def _profile_model(env: dict, model: dict, *, model_id: str, gguf_file: str, force: bool = False) -> dict:
     """Measure the loaded model once per GGUF x llama.cpp build x host (PLAN WP3).
 
@@ -15741,13 +15849,16 @@ def _profile_model(env: dict, model: dict, *, model_id: str, gguf_file: str, for
         return {"status": "unavailable", "reason": f"props-http-{status}"}
     facts = _model_profile_probes.static_facts(props)
     projector_sha = str(model.get("mmproj_sha256") or "").strip().lower() if isinstance(model, dict) else ""
+    # A fixed template (WP5) gets its own profile: /props then reports that
+    # template, and the key records which index entry supplied it.
+    template_override = _active_chat_template_override(env)
     key = _model_profile_store.profile_key(
         gguf_sha256=_model_profile_digests(model, gguf_file),
         projector_sha256=projector_sha if projector_sha and facts["vision"] else None,
         build_info=facts["buildInfo"],
         backend=_model_profile_backend(env),
         template_sha256=facts["templateSha256"],
-        template_source="embedded",
+        template_source=f"override:{template_override}" if template_override else "embedded",
         suite=_model_profile.SUITE_VERSION,
         host=_model_profile_store.host_id(),
     )
@@ -19603,6 +19714,12 @@ def _launch_native_llama_server(env_path: Path, llama_bin: Path, llama_log: Path
         imported_projector = _model_projector_file(_library_record_for_gguf(gguf_file), model_path.parent)
         if imported_projector is not None:
             args.extend(["--mmproj", str(imported_projector)])
+    # A fixed chat template the activation chose for an exact template match
+    # (WP5), checked against its SHA-256 before every launch. The LaunchAgent
+    # plist keeps these arguments across restarts.
+    template_file = _native_chat_template_file(env)
+    if template_file is not None:
+        args.extend(["--chat-template-file", str(template_file)])
     # On macOS the default runtime gets its reasoning flags from the tuning
     # helper below (--reasoning on b9014, where --reasoning-format none put an
     # empty think block into every reply). Everything else passes the format.

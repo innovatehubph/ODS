@@ -8163,3 +8163,238 @@ class TestManagedPixelThinkingControl:
     def test_thinking_control_kwargs_are_omitted_without_a_control(self):
         assert _mod._thinking_control_kwargs(None) == {}
         assert _mod._thinking_control_kwargs("always") == {"thinking_control": "always"}
+
+
+FIXED_TEMPLATE = b"{% for message in messages %}<|{{ message.role }}|>{{ message.content }}\n{% endfor %}"
+EMBEDDED_TEMPLATE_SHA = "e" * 64
+
+
+def _write_chat_templates(install_dir, *, embedded_sha=EMBEDDED_TEMPLATE_SHA, builds=("b11429", "b9014")):
+    """A chat-templates tree with one fixed template, as config/chat-templates ships it."""
+    root = install_dir / "config" / "chat-templates"
+    vendored = root / "upstream-b9014"
+    vendored.mkdir(parents=True)
+    (vendored / "LICENSE").write_bytes(b"MIT License\n")
+    (vendored / "Fixed-Model.jinja").write_bytes(FIXED_TEMPLATE)
+    file_sha = hashlib.sha256(FIXED_TEMPLATE).hexdigest()
+    (vendored / "SHA256SUMS").write_text(f"{file_sha}  Fixed-Model.jinja\n", encoding="utf-8")
+    entry = {
+        "id": "fixed-model-tools",
+        "embeddedTemplateSha256": embedded_sha,
+        "file": "upstream-b9014/Fixed-Model.jinja",
+        "fileSha256": file_sha,
+        "builds": list(builds),
+        "reason": "The model's own template drops tool calls.",
+    }
+    (root / "index.json").write_text(json.dumps({"schemaVersion": 1, "overrides": [entry]}), encoding="utf-8")
+    return entry
+
+
+def _no_runtime(_env, path, **_kwargs):
+    raise OSError(f"no llama-server in this test ({path})")
+
+
+class TestChatTemplateOverrideActivation:
+    """WP5 (TEST-PLAN T-U-5 item 3): a fixed template is set for its activation and cleared by the next."""
+
+    @pytest.fixture(autouse=True)
+    def _quiet_runtime(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_runtime_exchange", _no_runtime)
+        monkeypatch.setattr(_mod, "_chat_completion_ready", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(_mod, "_runtime_health", lambda _env: "ok")
+        monkeypatch.setattr(_mod, "_llama_runtime_props", lambda _env: (131072, ""))
+        monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(_mod, "_container_exists", lambda _container: False)
+        monkeypatch.setattr(_mod, "_container_running", lambda _container: False)
+        monkeypatch.setattr(_mod, "_verify_hermes_dashboard_ready", lambda: None)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", _mock_verified_readiness)
+
+    def _activate(self, install_dir, monkeypatch, **options):
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        handler = _ResponseHandler()
+        _mod.AgentHandler._do_model_activate(handler, "target-model", **options)
+        return handler
+
+    def test_the_container_loads_the_fixed_template_from_its_mount(self, tmp_path, monkeypatch):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path)
+        entry = _write_chat_templates(install_dir)
+
+        handler = self._activate(install_dir, monkeypatch, template_override=entry)
+
+        assert handler.response_code == 200, handler.parse_response()
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+        assert "MODEL_CHAT_TEMPLATE_OVERRIDE=fixed-model-tools" in lines
+        assert "LLAMA_ARG_CHAT_TEMPLATE_FILE=/chat-templates/upstream-b9014/Fixed-Model.jinja" in lines
+
+    def test_the_next_model_without_an_override_clears_it(self, tmp_path, monkeypatch):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path)
+        env_path.write_text(env_path.read_text(encoding="utf-8")
+                            + "MODEL_CHAT_TEMPLATE_OVERRIDE=fixed-model-tools\n"
+                            + "LLAMA_ARG_CHAT_TEMPLATE_FILE=/chat-templates/upstream-b9014/Fixed-Model.jinja\n",
+                            encoding="utf-8")
+
+        handler = self._activate(install_dir, monkeypatch)
+
+        assert handler.response_code == 200, handler.parse_response()
+        text = env_path.read_text(encoding="utf-8")
+        assert "MODEL_CHAT_TEMPLATE_OVERRIDE" not in text and "LLAMA_ARG_CHAT_TEMPLATE_FILE" not in text
+
+    def test_without_an_override_nothing_template_related_is_written(self, tmp_path, monkeypatch):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path)
+        _write_chat_templates(install_dir)
+
+        handler = self._activate(install_dir, monkeypatch)
+
+        assert handler.response_code == 200, handler.parse_response()
+        assert "chatTemplateOverride" not in json.dumps(handler.parse_response())
+        text = env_path.read_text(encoding="utf-8")
+        assert "MODEL_CHAT_TEMPLATE_OVERRIDE" not in text and "LLAMA_ARG_CHAT_TEMPLATE_FILE" not in text
+
+    def test_a_changed_template_file_is_refused_before_anything_changes(self, tmp_path, monkeypatch):
+        install_dir, env_path, env_text, *_ = _write_model_activation_fixture(tmp_path)
+        entry = _write_chat_templates(install_dir)
+        (install_dir / "config" / "chat-templates" / "upstream-b9014" / "Fixed-Model.jinja").write_bytes(b"{{ x }}")
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: pytest.fail("no restart"))
+
+        handler = self._activate(install_dir, monkeypatch, template_override=entry)
+
+        assert handler.response_code == 409
+        assert handler.parse_response()["code"] == "chat_template_override_unavailable"
+        assert env_path.read_text(encoding="utf-8") == env_text
+
+    def test_the_legacy_windows_runtime_refuses_an_override_in_words(self, tmp_path, monkeypatch):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path, gpu_backend="amd")
+        env_path.write_text(env_path.read_text(encoding="utf-8")
+                            + "AMD_INFERENCE_RUNTIME_MODE=windows-native-llama-server\n"
+                            + "AMD_INFERENCE_LOCATION=host\n", encoding="utf-8")
+        env_text = env_path.read_text(encoding="utf-8")
+        entry = _write_chat_templates(install_dir)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(_mod, "_restart_windows_native_llama_server",
+                            lambda *_a: pytest.fail("an unsupported override must not restart anything"))
+
+        handler = self._activate(install_dir, monkeypatch, template_override=entry)
+
+        assert handler.response_code == 409
+        response = handler.parse_response()
+        assert response["code"] == "chat_template_override_unsupported"
+        assert "cannot use a fixed chat template" in response["error"]
+        assert env_path.read_text(encoding="utf-8") == env_text
+
+    def test_windows_runtimes_have_no_template_input_yet(self, monkeypatch):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod.platform, "release", lambda: "5.15.167.4-microsoft-standard-WSL2")
+        assert _mod._chat_template_unsupported({}, {"managed": True}) is True
+        assert _mod._chat_template_unsupported({"ODS_HOST_LLM_TRANSPORT": "model-router"}, {"managed": False}) is True
+        assert _mod._chat_template_unsupported({"GPU_BACKEND": "nvidia"}, {"managed": False}) is False
+        assert _mod._chat_template_unsupported({"GPU_BACKEND": "apple"}, {"managed": False}) is False
+
+    def test_macos_records_the_override_for_its_native_launch(self, tmp_path, monkeypatch):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path, gpu_backend="apple")
+        entry = _write_chat_templates(install_dir)
+        llama_bin = install_dir / "bin" / "llama-server"
+        llama_bin.parent.mkdir(parents=True)
+        llama_bin.write_text("", encoding="utf-8")
+        (install_dir / "lib").mkdir()
+        (install_dir / "lib" / "constants.sh").write_text("# test fixture\n", encoding="utf-8")
+        (install_dir / "lib" / "bridge-manager.sh").write_text("# test fixture\n", encoding="utf-8")
+        launched_envs = []
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Darwin")
+        monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
+        monkeypatch.setattr(_mod, "_configure_macos_llm_bridge", lambda _env_path: None)
+        monkeypatch.setattr(_mod, "_launch_native_llama_server",
+                            lambda runtime_env_path, *_a: launched_envs.append(_mod.load_env(runtime_env_path)))
+        monkeypatch.setattr(_mod.subprocess, "run",
+                            lambda cmd, **_k: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
+
+        handler = self._activate(install_dir, monkeypatch, template_override=entry)
+
+        assert handler.response_code == 200, handler.parse_response()
+        (launched,) = launched_envs
+        assert launched["MODEL_CHAT_TEMPLATE_OVERRIDE"] == "fixed-model-tools"
+        # The container path means nothing to a native server; it is never written there.
+        assert "LLAMA_ARG_CHAT_TEMPLATE_FILE" not in launched
+        assert _mod.load_env(env_path) == launched
+
+    def test_the_native_launch_passes_the_file_after_the_projector(self, tmp_path, monkeypatch):
+        _write_chat_templates(tmp_path)
+        models = tmp_path / "data" / "models"
+        models.mkdir(parents=True)
+        (models / "mmproj-test.gguf").write_bytes(b"projector")
+        (tmp_path / "config" / "model-library.json").write_text(json.dumps({"models": [{
+            "id": "vision-model", "gguf_file": "test-model.gguf", "mmproj_file": "mmproj-test.gguf",
+        }]}), encoding="utf-8")
+        env_path = tmp_path / ".env"
+        env_path.write_text("GGUF_FILE=test-model.gguf\nCTX_SIZE=8192\n"
+                            "MODEL_CHAT_TEMPLATE_OVERRIDE=fixed-model-tools\n", encoding="utf-8")
+        calls = []
+
+        class _FakeProc:
+            pid = 4321
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **_k: calls.append(cmd) or _FakeProc())
+
+        _launch_native_llama_server(env_path, tmp_path / "bin" / "llama-server", tmp_path / "log", tmp_path / "pid")
+
+        (command,) = calls
+        position = command.index("--chat-template-file")
+        assert command[position - 2:position] == ["--mmproj", str(models / "mmproj-test.gguf")]
+        assert Path(command[position + 1]) == (
+            tmp_path / "config" / "chat-templates" / "upstream-b9014" / "Fixed-Model.jinja")
+
+    def test_a_native_launch_without_an_override_has_no_template_argument(self, tmp_path, monkeypatch):
+        (tmp_path / "data" / "models").mkdir(parents=True)
+        env_path = tmp_path / ".env"
+        env_path.write_text("GGUF_FILE=test-model.gguf\n", encoding="utf-8")
+        calls = []
+
+        class _FakeProc:
+            pid = 4321
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **_k: calls.append(cmd) or _FakeProc())
+
+        _launch_native_llama_server(env_path, tmp_path / "bin" / "llama-server", tmp_path / "log", tmp_path / "pid")
+
+        assert "--chat-template-file" not in calls[0]
+
+    def test_a_native_launch_refuses_an_unknown_or_changed_template(self, tmp_path, monkeypatch):
+        install_dir = tmp_path / "install"
+        _write_chat_templates(install_dir)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+
+        assert _mod._native_chat_template_file({}) is None
+        assert _mod._native_chat_template_file({"MODEL_CHAT_TEMPLATE_OVERRIDE": "fixed-model-tools"}).name == \
+            "Fixed-Model.jinja"
+        with pytest.raises(RuntimeError, match="not in this installation's template index"):
+            _mod._native_chat_template_file({"MODEL_CHAT_TEMPLATE_OVERRIDE": "unknown-fix"})
+        (install_dir / "config" / "chat-templates" / "upstream-b9014" / "Fixed-Model.jinja").write_bytes(b"x")
+        with pytest.raises(ValueError, match="does not match its recorded SHA-256"):
+            _mod._native_chat_template_file({"MODEL_CHAT_TEMPLATE_OVERRIDE": "fixed-model-tools"})
+
+    def test_an_override_gets_its_own_profile(self, tmp_path, monkeypatch):
+        install_dir, *_ = _write_model_activation_fixture(tmp_path)
+        entry = _write_chat_templates(install_dir)
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_model_profile_probes as scripted
+
+        runtime = scripted.Runtime()
+
+        def exchange(_env, path, *, payload=None, timeout=30):
+            if path == "/props":
+                return 200, json.dumps(TestModelProfileInActivation.PROPS)
+            return runtime(path, payload, timeout)
+
+        monkeypatch.setattr(_mod, "_runtime_exchange", exchange)
+
+        assert self._activate(install_dir, monkeypatch).response_code == 200
+        assert self._activate(install_dir, monkeypatch, template_override=entry).response_code == 200
+
+        store = json.loads((install_dir / "data" / "model-profiles.json").read_text(encoding="utf-8"))
+        sources = [profile["key"]["templateSource"] for profile in store["profiles"]]
+        assert sources == ["embedded", "override:fixed-model-tools"]
+        assert store["lastActivation"]["keyHash"] == store["profiles"][-1]["keyHash"]
