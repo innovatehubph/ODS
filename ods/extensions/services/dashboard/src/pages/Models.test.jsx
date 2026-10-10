@@ -1306,7 +1306,11 @@ test('keeps Run visible with the runtime-mode reason when activation is unavaila
   expect(loadModel).not.toHaveBeenCalled()
 })
 
-test('keeps Run visible with the VRAM requirement when the model does not fit', () => {
+const RUN_ANYWAY_TEXT = 'Run it anyway. It may run slowly using system memory, or ODS goes back to your current model if it cannot load.'
+
+test('keeps Run visible with the VRAM requirement when the model does not fit, and runs only after Run anyway is ticked', () => {
+  // The host does not refuse a model above the GPU estimate on one GPU, so the
+  // requirement is a warning the owner accepts in the run dialog, not a stop.
   const loadModel = vi.fn()
   useModelsMock.mockReturnValue(baseState({
     loadModel,
@@ -1321,9 +1325,76 @@ test('keeps Run visible with the VRAM requirement when the model does not fit', 
   renderModels()
 
   const runButton = screen.getByRole('button', { name: /^run$/i })
-  expect(runButton).toBeDisabled()
+  expect(runButton).toBeEnabled()
   expect(runButton).toHaveAttribute('title', 'Requires 12 GB VRAM; the detected GPU has 8.0 GB total.')
   fireEvent.click(runButton)
+  expect(loadModel).not.toHaveBeenCalled()
+
+  const dialog = screen.getByRole('dialog', { name: 'Qwen 3.5 9B' })
+  expect(within(dialog).getByText(/exceeds the reported GPU memory estimate/i)).toBeInTheDocument()
+  const runAnyway = within(dialog).getByRole('checkbox', { name: RUN_ANYWAY_TEXT })
+  expect(runAnyway).not.toBeChecked()
+  expect(within(dialog).getByRole('link', { name: 'Get help on Discord' })).toHaveAttribute('href', 'https://discord.gg/4ntNp9MAwC')
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeDisabled()
+  confirmModelRun()
+  expect(loadModel).not.toHaveBeenCalled()
+
+  fireEvent.click(runAnyway)
+  expect(runAnyway).toBeChecked()
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeEnabled()
+  confirmModelRun()
+  expect(loadModel).toHaveBeenCalledWith('qwen3.5-9b-q4', { contextLength: 65536 })
+})
+
+test('shows the memory warning in compact details while Run stays available', () => {
+  useModelsMock.mockReturnValue(baseState({
+    models: [model({
+      status: 'downloaded',
+      fitsVram: false,
+      vramRequired: 12,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 12, fitsVram: false }],
+    })],
+  }))
+  render(createElement(MemoryRouter, null, createElement(Models, { compact: true })))
+  const entry = screen.getByRole('article', { name: 'Qwen 3.5 9B' })
+  expect(within(entry).getByText('Requires 12 GB VRAM; the detected GPU has 8.0 GB total.')).toBeInTheDocument()
+  expect(within(entry).getByRole('button', { name: /^run$/i })).toBeEnabled()
+})
+
+test('a busy runtime still disables Run for a model that does not fit', () => {
+  useModelsMock.mockReturnValue(baseState({
+    activationLoading: 'another-model',
+    models: [model({
+      status: 'downloaded',
+      fitsVram: false,
+      vramRequired: 12,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 12, fitsVram: false }],
+    })],
+  }))
+  renderModels()
+  const runButton = screen.getByRole('button', { name: /^run$/i })
+  expect(runButton).toBeDisabled()
+  expect(runButton).toHaveAttribute('title', 'Wait for the current model swap to finish.')
+})
+
+test('keeps the hard stop when ODS cannot read the machine memory', () => {
+  const loadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({
+    loadModel,
+    gpu: null,
+    models: [model({
+      status: 'downloaded',
+      fitsVram: false,
+      vramRequired: 12,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 12, fitsVram: null }],
+    })],
+  }))
+  renderModels()
+  const runButton = screen.getByRole('button', { name: /^run$/i })
+  expect(runButton).toBeDisabled()
+  expect(runButton).toHaveAttribute('title', 'This model does not fit the detected GPU memory.')
+  fireEvent.click(runButton)
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   expect(loadModel).not.toHaveBeenCalled()
 })
 
@@ -1455,7 +1526,9 @@ test('explains the model memory budget separately from detected shared GPU memor
   }))
   renderModels()
   const run = screen.getByRole('button', { name: /^run$/i })
-  expect(run).toBeDisabled()
+  // Above the budget but within the machine's 32 GB of shared memory, the
+  // requirement is a warning: Run stays available behind the Run anyway tick.
+  expect(run).toBeEnabled()
   expect(run).toHaveAttribute('title', 'Requires 23.8 GB; ODS has a 17.6 GB model memory budget (32 GB GPU memory detected).')
 })
 
@@ -1466,5 +1539,65 @@ test('does not invent a fitting context above the supplied model memory budget',
       sizeGb: 20.6, contextLength: 65536, maxContextLength: 65536, contextOptions: [] })],
   }))
   renderModels()
-  expect(screen.getByRole('button', { name: /^run$/i })).toBeDisabled()
+  // No context is treated as fitting: the budget warning stays on Run, and the
+  // dialog runs only after the explicit Run anyway tick.
+  const run = screen.getByRole('button', { name: /^run$/i })
+  expect(run).toHaveAttribute('title', 'Requires 23.8 GB; ODS has a 17.6 GB model memory budget (32 GB GPU memory detected).')
+  fireEvent.click(run)
+  expect(screen.getByRole('checkbox', { name: RUN_ANYWAY_TEXT })).not.toBeChecked()
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeDisabled()
+})
+
+test('keeps a hard stop on shared memory when the model needs more than the machine has', () => {
+  // Apple silicon reports its whole memory as the GPU total and a smaller
+  // model budget. A model larger than that total cannot run at all there.
+  const loadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({
+    loadModel,
+    gpu: { vramTotal: 32, vramUsed: 9, vramFree: 23, modelMemoryBudgetGb: 17.6 },
+    models: [model({ status: 'downloaded', fitsVram: false, estimatedRequired: 40,
+      contextOptions: [{ contextLength: 65536, estimatedRequired: 40, fitsVram: false }] })],
+  }))
+  renderModels()
+  const run = screen.getByRole('button', { name: /^run$/i })
+  expect(run).toBeDisabled()
+  expect(run).toHaveAttribute('title', 'Requires 40 GB; ODS has a 17.6 GB model memory budget (32 GB GPU memory detected).')
+  fireEvent.click(run)
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(loadModel).not.toHaveBeenCalled()
+})
+
+test('on shared memory, offers Run anyway only for contexts within the machine memory', () => {
+  const loadModel = vi.fn()
+  useModelsMock.mockReturnValue(baseState({
+    loadModel,
+    gpu: { vramTotal: 32, vramUsed: 9, vramFree: 23, modelMemoryBudgetGb: 17.6 },
+    models: [model({
+      status: 'downloaded', fitsVram: false, estimatedRequired: 20,
+      contextLength: 65536, maxContextLength: 131072,
+      contextOptions: [
+        { contextLength: 16384, estimatedRequired: 12, fitsVram: true },
+        { contextLength: 65536, estimatedRequired: 20, fitsVram: false, recommended: true },
+        { contextLength: 131072, estimatedRequired: 36, fitsVram: false, fullContext: true },
+      ],
+    })],
+  }))
+  renderModels()
+  fireEvent.click(screen.getByRole('button', { name: /^run$/i }))
+  const dialog = screen.getByRole('dialog', { name: 'Qwen 3.5 9B' })
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeEnabled()
+
+  fireEvent.click(within(dialog).getByRole('button', { name: /128K Full context/i }))
+  expect(within(dialog).getByText(/This context needs about 36 GB, more than the 32 GB of memory this machine has\. Choose a shorter context\./)).toBeInTheDocument()
+  expect(within(dialog).getByRole('link', { name: 'Get help on Discord' })).toBeInTheDocument()
+  expect(within(dialog).queryByRole('checkbox')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeDisabled()
+
+  fireEvent.click(within(dialog).getByRole('button', { name: /64K Recommended/i }))
+  expect(within(dialog).queryByText(/more than the 32 GB of memory this machine has/)).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeDisabled()
+  fireEvent.click(within(dialog).getByRole('checkbox', { name: RUN_ANYWAY_TEXT }))
+  expect(screen.getByRole('button', { name: 'Run model' })).toBeEnabled()
+  confirmModelRun()
+  expect(loadModel).toHaveBeenCalledWith('qwen3.5-9b-q4', { contextLength: 65536 })
 })
