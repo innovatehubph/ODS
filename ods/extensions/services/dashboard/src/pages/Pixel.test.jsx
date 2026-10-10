@@ -977,6 +977,105 @@ describe('Pixel', () => {
     }
   )
 
+  const MODEL_ADVISORY_TEXT = {
+    'context-too-small': 'This model runs with less than 16K tokens of context, too small for Portal tasks. Set its context to 16K or more in Models, or switch model.',
+    'tools-unavailable': 'This model failed the tool-call check, so Portal tasks that use tools will likely fail. Chat still works.',
+    'not-profiled': 'ODS has not checked this model yet, so Portal tasks may not work. To check it, choose Check again on the running model in Models.',
+    'thinking-always-on': 'This model always thinks before it answers, so Portal tasks are slower and use more of its context.',
+  }
+
+  it.each(Object.entries(MODEL_ADVISORY_TEXT))(
+    'shows the fixed %s advisory with a switch link and help, above the conversation before the first task', async (reason, text) => {
+      globalThis.fetch.mockResolvedValue(response({
+        available: true, model: 'pixel/default',
+        modelSupport: { tier: 'adaptive', detail: 'Server wording that is never shown.', reason },
+      }))
+      render(<Pixel />)
+      const banner = await screen.findByRole('status', { name: 'Model capability' })
+      expect(banner).toHaveTextContent(text)
+      expect(screen.queryByText(/Server wording/)).not.toBeInTheDocument()
+      expect(screen.getByText('Available')).toHaveAttribute('title', text)
+      expect(within(banner).getByRole('link', { name: 'Switch model' })).toHaveAttribute('href', '/models')
+      expect(within(banner).getByRole('link', { name: 'Get help on Discord' })).toHaveAttribute('href', 'https://discord.gg/4ntNp9MAwC')
+      expect(screen.getByText('What do you want to work on?')).toBeVisible()
+      const conversation = screen.getByRole('region', { name: 'Conversation messages' })
+      expect(banner.compareDocumentPosition(conversation) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      expect(screen.getByPlaceholderText('Message Portal...')).toBeEnabled()
+    }
+  )
+
+  it('never disables sending while a model advisory is shown', async () => {
+    globalThis.fetch.mockImplementation(async url => url === '/api/pixel/chat/stream'
+      ? sseResponse([JSON.stringify({ choices: [{ delta: { content: 'Chat still answers' } }] }), '[DONE]'])
+      : response({
+        available: true, model: 'pixel/default',
+        modelSupport: { tier: 'adaptive', detail: 'Tools failed.', reason: 'tools-unavailable' },
+      }))
+    render(<Pixel />)
+    await screen.findByRole('status', { name: 'Model capability' })
+    const composer = screen.getByPlaceholderText('Message Portal...')
+    expect(composer).toBeEnabled()
+    fireEvent.change(composer, { target: { value: 'run a task anyway' } })
+    expect(screen.getByTitle('Send')).toBeEnabled()
+    fireEvent.click(screen.getByTitle('Send'))
+    expect(await screen.findByText('Chat still answers')).toBeInTheDocument()
+    const sends = globalThis.fetch.mock.calls.filter(([url]) => url === '/api/pixel/chat/stream')
+    expect(sends).toHaveLength(1)
+    expect(JSON.parse(sends[0][1].body).messages.at(-1).content).toBe('run a task anyway')
+    expect(screen.getByRole('status', { name: 'Model capability' })).toHaveTextContent(MODEL_ADVISORY_TEXT['tools-unavailable'])
+  })
+
+  it('keeps a specific advisory when an older model gate refuses a send', async () => {
+    globalThis.fetch.mockImplementation(async url => url === '/api/pixel/chat/stream'
+      ? response({ detail: 'Pixel is ready and adapts its tool flow for this model.' }, 412)
+      : response({
+        available: true, model: 'pixel/default',
+        modelSupport: { tier: 'adaptive', detail: 'Not checked.', reason: 'not-profiled' },
+      }))
+    render(<Pixel />)
+    await screen.findByRole('status', { name: 'Model capability' })
+    fireEvent.change(screen.getByPlaceholderText('Message Portal...'), { target: { value: 'keep this request' } })
+    fireEvent.click(screen.getByTitle('Send'))
+    await waitFor(() => expect(globalThis.fetch.mock.calls.some(([url]) => url === '/api/pixel/chat/stream')).toBe(true))
+    await waitFor(() => expect(screen.getByPlaceholderText('Message Portal...')).toHaveValue('keep this request'))
+    expect(screen.getByPlaceholderText('Message Portal...')).toBeEnabled()
+    expect(screen.getByRole('status', { name: 'Model capability' })).toHaveTextContent(MODEL_ADVISORY_TEXT['not-profiled'])
+    expect(screen.getByRole('status', { name: 'Model capability' })).not.toHaveTextContent('not agent-qualified')
+  })
+
+  it('renders a legacy advisory exactly as before, without the switch link or help', async () => {
+    globalThis.fetch.mockResolvedValue(response({
+      available: true, model: 'pixel/default',
+      modelSupport: { tier: 'adaptive', detail: 'Pixel is ready and adapts its tool flow for this model.' },
+    }))
+    render(<Pixel />)
+    const banner = await screen.findByRole('status', { name: 'Model capability' })
+    expect(banner.textContent).toBe('The active model is recorded as not agent-qualified. Tool-driven tasks may be unreliable; chat and experiments remain available.')
+    expect(within(banner).queryByRole('link')).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: 'Switch model' })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    { tier: 'adaptive', detail: 'Shown?', reason: 'unknown-reason' },
+    { tier: 'adaptive', detail: 'Shown?', reason: 'toString' },
+    { tier: 'adaptive', detail: 'Shown?', reason: null },
+    { tier: 'adaptive', detail: 'Shown?', reason: ['tools-unavailable'] },
+    { tier: 'adaptive', detail: 'Shown?', reason: 'tools-unavailable', extra: true },
+    { tier: 'qualified', detail: 'Shown?', reason: 'tools-unavailable' },
+    { tier: 'adaptive', detail: '', reason: 'tools-unavailable' },
+    { tier: 'adaptive', detail: 'x'.repeat(513), reason: 'tools-unavailable' },
+    { tier: 'adaptive', reason: 'tools-unavailable' },
+  ])('rejects a malformed or unknown advisory reason like any other bad answer: %j', async modelSupport => {
+    globalThis.fetch.mockResolvedValue(response({ available: true, model: 'pixel/default', modelSupport }))
+    render(<Pixel />)
+    await waitFor(() => expect(screen.getByText('Available')).toBeInTheDocument())
+    expect(screen.queryByRole('status', { name: 'Model capability' })).not.toBeInTheDocument()
+    expect(screen.getByText('Available')).not.toHaveAttribute('title')
+    expect(screen.queryByRole('link', { name: 'Switch model' })).not.toBeInTheDocument()
+    expect(screen.getByPlaceholderText('Message Portal...')).toBeEnabled()
+  })
+
   it('preserves a draft when model viability changes before stream acceptance', async () => {
     globalThis.fetch
       .mockResolvedValueOnce(response({ available: true, model: 'pixel/default', detail: 'local' }))

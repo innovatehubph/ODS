@@ -7,6 +7,7 @@ import {validSourceReview} from '../lib/pixelSourceReview'
 import { readConversations, saveConversation, createConversationWriter, SELECT_EVENT, DELETE_EVENT, deleteConversation, purgeConversationImages, isConversationDeleted } from '../lib/pixelConversations'
 import {usePixelAutoScroll} from '../lib/usePixelAutoScroll'
 import { Link } from 'react-router-dom'
+import HelpLink from '../components/HelpLink'
 import PixelAdvice from '../components/PixelAdvice.jsx'
 import PixelMascot from '../components/PixelMascot.jsx'
 import UserAvatar from '../components/UserAvatar'
@@ -79,6 +80,18 @@ import {
 } from 'lucide-react'
 
 const MODEL_CAPABILITY_DETAIL = 'The active model is recorded as not agent-qualified. Tool-driven tasks may be unreliable; chat and experiments remain available.'
+// Fixed client copy for each reason the status may give. The server's own
+// detail text is never shown, and an unknown reason is rejected.
+const MODEL_ADVISORIES = new Map([
+  ['context-too-small', 'This model runs with less than 16K tokens of context, too small for Portal tasks. Set its context to 16K or more in Models, or switch model.'],
+  ['tools-unavailable', 'This model failed the tool-call check, so Portal tasks that use tools will likely fail. Chat still works.'],
+  ['not-profiled', 'ODS has not checked this model yet, so Portal tasks may not work. To check it, choose Check again on the running model in Models.'],
+  ['thinking-always-on', 'This model always thinks before it answers, so Portal tasks are slower and use more of its context.'],
+])
+const LEGACY_MODEL_SUPPORT = { tier: 'adaptive', detail: MODEL_CAPABILITY_DETAIL }
+// A refused send shows the generic advisory, but never replaces a more
+// specific one the status already gave.
+const keepModelAdvisory = current => current?.reason ? current : LEGACY_MODEL_SUPPORT
 
 const MARKDOWN_COMPONENTS = {
   p: ({ children }) => <p className="break-words [&:not(:first-child)]:mt-3">{children}</p>,
@@ -913,7 +926,9 @@ export default function Pixel({ systemStatus = null }) {
         const supportKeys = support && typeof support === 'object' && !Array.isArray(support)
           ? Object.keys(support).sort().join('\n')
           : ''
-        const validatedSupport = supportKeys === ['detail', 'tier'].join('\n')
+        const knownReason = supportKeys === ['detail', 'reason', 'tier'].join('\n')
+          && MODEL_ADVISORIES.has(support.reason)
+        const validatedSupport = (supportKeys === ['detail', 'tier'].join('\n') || knownReason)
           && support.tier === 'adaptive'
           && typeof support.detail === 'string'
           && support.detail.length > 0
@@ -925,9 +940,11 @@ export default function Pixel({ systemStatus = null }) {
         const legacyAdaptive = data.state === 'model_incompatible'
         // Older APIs called this tier "adaptive" and claimed readiness. That
         // label records lack of qualification, not measured tool adaptation.
-        setModelSupport(validatedSupport || legacyAdaptive
-          ? { tier: 'adaptive', detail: MODEL_CAPABILITY_DETAIL }
-          : null)
+        setModelSupport(validatedSupport?.reason
+          ? { tier: 'adaptive', reason: validatedSupport.reason, detail: MODEL_ADVISORIES.get(validatedSupport.reason) }
+          : validatedSupport || legacyAdaptive
+            ? LEGACY_MODEL_SUPPORT
+            : null)
         setStatus(data.available === true || legacyAdaptive
           ? 'available'
           : data.state === 'model_switching'
@@ -1302,7 +1319,7 @@ export default function Pixel({ systemStatus = null }) {
       }
       if (attempt.kind === 'adaptive') {
         setStatus('available')
-        setModelSupport({ tier: 'adaptive', detail: MODEL_CAPABILITY_DETAIL })
+        setModelSupport(keepModelAdvisory)
         setInput(trimmed)
         contextStartRef.current = originalContextStart
         setMessages(messages)
@@ -1346,7 +1363,7 @@ export default function Pixel({ systemStatus = null }) {
           setMessages(messages)
           setInput(trimmed)
           setStatus('available')
-          setModelSupport({ tier: 'adaptive', detail: MODEL_CAPABILITY_DETAIL })
+          setModelSupport(keepModelAdvisory)
           return
         }
         if (!attempt.receivedError && attempt.receivedDone && attempt.recoveryEligible) {
@@ -1713,6 +1730,11 @@ export default function Pixel({ systemStatus = null }) {
       {status === 'available' && modelSupport && (
         <p role="status" aria-label="Model capability" className="shrink-0 border-b border-theme-border px-4 py-2 text-xs text-theme-text-secondary sm:px-6">
           {modelSupport.detail}
+          {/* An advisory informs; it never disables sending. */}
+          {modelSupport.reason && <>
+            {' '}<Link className="text-theme-accent-light underline" to="/models">Switch model</Link>
+            {' '}<HelpLink />
+          </>}
         </p>
       )}
       <div role="region" aria-label="Conversation messages" tabIndex={-1} onScroll={chatScroll.onScroll} className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-5 sm:px-6">
