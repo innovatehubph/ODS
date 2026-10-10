@@ -1937,7 +1937,7 @@ cat > "$runtime_validator" <<'SH'
 set -euo pipefail
 [[ "$1 $2" == "config validate" ]]
 python3 - "$OPENCLAW_CONFIG_PATH" <<'PY'
-import json, pathlib, re, sys
+import json, os, pathlib, re, sys
 value = json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["agents"]["defaults"]["timeoutSeconds"] == 1800
 assert value["agents"]["defaults"]["bootstrapMaxChars"] == 32000
@@ -2030,7 +2030,17 @@ assert value["agents"]["defaults"]["compaction"] == {
     "timeoutSeconds": 1800,
     "keepRecentTokens": max(512, min(20000, context_window // 16)),
 }
-if "qwen" in model["id"].lower() and model["reasoning"] is True:
+# A case that renders a measured thinking control names it here; the config
+# itself never carries it. Without one, the "qwen" name rule applies.
+thinking_control = os.environ.get("ODS_TEST_THINKING_CONTROL")
+enable_thinking_switch = ("qwen" in model["id"].lower() if thinking_control is None
+                          else thinking_control == "enable_thinking")
+if thinking_control in ("always", "none"):
+    assert model["reasoning"] is (thinking_control == "always")
+    assert "thinkingDefault" not in agent
+    assert "compat" not in model
+    assert "chat_template_kwargs" not in agent.get("params", {})
+elif enable_thinking_switch and model["reasoning"] is True:
     assert agent["thinkingDefault"] == "low"
     assert model["compat"] == {"thinkingFormat": "qwen-chat-template"}
     assert agent["params"]["chat_template_kwargs"]["enable_thinking"] is True
@@ -2038,7 +2048,7 @@ else:
     assert "thinkingDefault" not in agent
     assert model["reasoning"] is False
     assert "compat" not in model
-    if "qwen" in model["id"].lower():
+    if enable_thinking_switch:
         assert agent["params"]["chat_template_kwargs"]["enable_thinking"] is False
 if lean_prompt:
     params = agent["params"]
@@ -2436,6 +2446,47 @@ fi
 check test "$(_ods_pixel_apply_runtime_budget "$owner" "$reconcile_home" "$reconcile_candidate" "$runtime_validator" "$reconcile_answers")" = changed
 check python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); a=v["agents"]["list"][0]; m=v["models"]["providers"]["ods-local"]["models"][0]; assert m["reasoning"] is True and m["compat"] == {"thinkingFormat":"qwen-chat-template"} and a["thinkingDefault"] == "low" and a["params"]["chat_template_kwargs"]["enable_thinking"] is True' "$reconcile_candidate"
 check _ods_pixel_candidate_is_managed_runtime_update "$owner" "$reconcile_home" "$reconcile_candidate" "$reconcile_answers"
+# A measured thinking control in the answers replaces the "qwen" name rule for
+# the same route. The validator accepts exactly what the renderer writes for
+# each control and refuses a candidate rendered for another one.
+for thinking_control in enable_thinking always none; do
+    control_answers="$TEST_ROOT/thinking-$thinking_control-onboarding.json"
+    control_candidate="$TEST_ROOT/thinking-$thinking_control-candidate.json"
+    python3 - "$reconcile_answers" "$control_answers" "$thinking_control" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+value["modelThinkingControl"] = sys.argv[3]
+pathlib.Path(sys.argv[2]).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+PY
+    cp "$reconcile_candidate" "$control_candidate"
+    chmod 0600 "$control_answers" "$control_candidate"
+    export ODS_TEST_THINKING_CONTROL="$thinking_control"
+    check test -n "$(_ods_pixel_apply_runtime_budget "$owner" "$reconcile_home" "$control_candidate" "$runtime_validator" "$control_answers")"
+    unset ODS_TEST_THINKING_CONTROL
+    check python3 - "$control_candidate" "$thinking_control" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1]))
+agent = value["agents"]["list"][0]
+model = value["models"]["providers"]["ods-local"]["models"][0]
+thinking = (model["reasoning"], model.get("compat"), agent.get("thinkingDefault"),
+            agent.get("params", {}).get("chat_template_kwargs"))
+assert thinking == {
+    "enable_thinking": (True, {"thinkingFormat": "qwen-chat-template"}, "low", {"enable_thinking": True}),
+    "always": (True, None, None, None),
+    "none": (False, None, None, None),
+}[sys.argv[2]], thinking
+assert "modelThinkingControl" not in value["plugins"]["entries"]["pixel-ods"]["config"]
+PY
+    check _ods_pixel_candidate_is_managed_runtime_update "$owner" "$reconcile_home" "$control_candidate" "$control_answers"
+    if [[ "$thinking_control" != enable_thinking ]]; then
+        if _ods_pixel_candidate_is_managed_runtime_update "$owner" "$reconcile_home" \
+            "$control_candidate" "$reconcile_answers" >/dev/null 2>&1; then
+            fail "candidate rendered for thinking control $thinking_control rejected under the name rule"
+        else
+            pass "candidate rendered for thinking control $thinking_control rejected under the name rule"
+        fi
+    fi
+done
 cp "$reconcile_config" "$TEST_ROOT/reconcile-config-with-control-bind.json"
 python3 - "$reconcile_config" <<'PY'
 import json, pathlib, sys

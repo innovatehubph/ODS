@@ -1533,12 +1533,18 @@ def validate_live_route(provider_id, provider_value, model, agent):
 live_provider_id, live_provider, live_model, live_agent = binding(live)
 candidate_provider_id, candidate_provider, candidate_model, candidate_agent = binding(candidate, provider)
 validate_live_route(live_provider_id, live_provider, live_model, live_agent)
+thinking_control = contract.get("modelThinkingControl")
+if thinking_control not in (None, "enable_thinking", "always", "none"):
+    raise SystemExit("invalid candidate Pixel thinking-control contract")
+# Same rule as pixel-runtime-budget.py: a measured "always" or "none" chat
+# template wins over the requested reasoning flag.
+model_reasoning = {"always": True, "none": False}.get(thinking_control, contract.get("modelReasoning"))
 expected_model = {
     "id": model_id,
     "name": model_name,
     "contextWindow": contract.get("modelContextWindow"),
     "maxTokens": contract.get("modelMaxTokens"),
-    "reasoning": contract.get("modelReasoning"),
+    "reasoning": model_reasoning,
 }
 image_input = contract.get("modelImageInput", "unknown")
 if image_input not in ("supported", "unsupported", "unknown"):
@@ -1576,7 +1582,7 @@ normalized_model["id"] = model_id
 normalized_model["name"] = model_name
 normalized_model["contextWindow"] = contract.get("modelContextWindow")
 normalized_model["maxTokens"] = contract.get("modelMaxTokens")
-normalized_model["reasoning"] = contract.get("modelReasoning")
+normalized_model["reasoning"] = model_reasoning
 normalized_model["input"] = expected_model["input"]
 normalized_agent["model"] = f"{provider}/{model_id}"
 normalized_defaults = normalized_agents.get("defaults") if isinstance(normalized_agents, dict) else None
@@ -1810,7 +1816,9 @@ for tools in (normalized_tools['alsoAllow'], normalized_sandbox_tools['allow']):
         tools.remove(project_tool)
 if project_enabled:
     normalized_agent_tools['deny'] = [tool for tool in normalized_agent_tools['deny'] if tool != project_tool]
-if "qwen" in model_label and contract.get("modelReasoning") is True:
+enable_thinking_switch = ("qwen" in model_label if thinking_control is None
+                          else thinking_control == "enable_thinking")
+if enable_thinking_switch and model_reasoning is True:
     normalized_model["compat"] = {"thinkingFormat": "qwen-chat-template"}
     normalized_agent["thinkingDefault"] = "low"
 else:
@@ -1819,11 +1827,11 @@ else:
 normalized_agent_params = normalized_agent.setdefault("params", {})
 if not isinstance(normalized_agent_params, dict):
     raise SystemExit("live Pixel agent parameters are outside the ODS contract")
-if "qwen" in model_label:
+if enable_thinking_switch:
     template_kwargs = normalized_agent_params.setdefault("chat_template_kwargs", {})
     if not isinstance(template_kwargs, dict):
         raise SystemExit("live Pixel chat-template parameters are outside the ODS contract")
-    template_kwargs["enable_thinking"] = contract.get("modelReasoning") is True
+    template_kwargs["enable_thinking"] = model_reasoning is True
 else:
     template_kwargs = normalized_agent_params.get("chat_template_kwargs")
     if isinstance(template_kwargs, dict):
