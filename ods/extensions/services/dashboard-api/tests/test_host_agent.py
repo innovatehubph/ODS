@@ -6010,6 +6010,21 @@ class TestModelActivationOwnership:
         payload = {"status": "idle"}
         _mod._project_switchboard_agent_viability(payload)
         assert payload["activeModelProfile"] == {"state": "measured", "tools": False, "thinkingControl": "always"}
+        # The route was recorded agent-viable before profiles were on (an upgrade):
+        # the failed tool check narrows it now, not at the next switch.
+        assert payload["activeAgentViable"] is False
+
+    def test_a_verified_catalog_model_stays_agent_viable_in_status(self, tmp_path, monkeypatch):
+        install_dir = self._profiled_install(tmp_path, monkeypatch, mode="enabled", summary=self.SUMMARY)
+        (install_dir / "config").mkdir()
+        (install_dir / "config" / "model-library.json").write_text(json.dumps({"models": [{
+            "id": "same-model", "gguf_file": "same-model.gguf",
+            "app_compatibility": {"pixel_agent": {"status": "verified"}},
+        }]}), encoding="utf-8")
+        payload = {}
+        _mod._project_switchboard_agent_viability(payload)
+        assert payload["activeModelProfile"]["tools"] is False
+        assert payload["activeAgentViable"] is True
 
     @pytest.mark.parametrize("mode", ["observe", "off"])
     def test_model_status_is_unchanged_without_enabled_profiles(self, tmp_path, monkeypatch, mode):

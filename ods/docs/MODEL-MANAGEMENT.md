@@ -277,10 +277,13 @@ from the next switch:
   or always thinks before it answers. Chat always stays available.
 - ODS Talk notes when the model failed the tool check; Talk stays available.
 - Portal's agent is told whether the model reasons and reads images from the
-  check, instead of from the model's name and the catalog.
+  check, instead of from the model's name and the catalog. Where Pixel is
+  managed without the Portal coordinator, its rendered config also follows
+  the measured way of turning thinking off.
 
-**Check again** updates the Portal and Talk advisories at once; the route and
-Portal's agent settings follow on the next switch.
+Turning `enabled` on, or **Check again**, updates the advisories and the
+agent-ready status at once; the route record and Portal's agent settings
+follow on the next switch.
 
 #### Fixed chat templates
 

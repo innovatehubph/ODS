@@ -2663,6 +2663,7 @@ def _project_switchboard_agent_viability(payload: dict) -> None:
     projected = agent_viable
     catalog_id = active.get("catalogId")
     context_length = active.get("contextLength")
+    catalog_model = None
     if isinstance(catalog_id, str) and isinstance(context_length, int):
         try:
             catalog_model = next(
@@ -2680,6 +2681,12 @@ def _project_switchboard_agent_viability(payload: dict) -> None:
                 catalog_model,
                 context_length,
             )
+    # With profiles enabled a failed tool check narrows it as well, at once
+    # (after an upgrade or "Check again") instead of at the next switch; a
+    # curated "verified" agent verdict keeps a model agent-viable (WP4.1).
+    if (active_profile is not None and active_profile.get("tools") is False
+            and not _catalog_agent_verified(catalog_model)):
+        projected = False
     payload["activeAgentViable"] = projected
 
 
