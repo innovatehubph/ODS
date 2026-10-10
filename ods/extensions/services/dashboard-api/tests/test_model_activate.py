@@ -7780,6 +7780,207 @@ class TestModelProfileInActivation:
         assert handler.parse_response()["profile"] == {"status": "off"}
         assert [path for path in order if path != "consumers"] == [] and "profiling" not in phases
 
+    # WP4 (TEST-PLAN T-U-4): with ODS_MODEL_PROFILES=enabled the measured profile
+    # replaces the catalog booleans; observe stays identical to off.
+
+    def _runtime(self, props=None, **answers):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import test_model_profile_probes as scripted
+
+        def factory(order):
+            runtime = scripted.Runtime(**{key: make(scripted) for key, make in answers.items()})
+
+            def exchange(_env, path, *, payload=None, timeout=30):
+                order.append(path)
+                if path == "/props":
+                    return 200, json.dumps(props or self.PROPS)
+                return runtime(path, payload, timeout)
+
+            return exchange
+
+        return factory
+
+    def _profiled_fixture(self, tmp_path, *, mode, entry=None, env_extra=""):
+        install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path)
+        library = install_dir / "config" / "model-library.json"
+        document = json.loads(library.read_text(encoding="utf-8"))
+        document["models"][0].update({"context_length": 65536, **(entry or {})})
+        library.write_text(json.dumps(document), encoding="utf-8")
+        env_path.write_text(env_path.read_text(encoding="utf-8").replace("CTX_SIZE=2048", "CTX_SIZE=65536")
+                            + f"ODS_MODEL_PROFILES={mode}\n{env_extra}", encoding="utf-8")
+        return install_dir
+
+    def _pixel_targets(self, monkeypatch):
+        targets = []
+
+        def reconcile(model, context_length, **kwargs):
+            targets.append({"model": model, "contextLength": context_length, **kwargs})
+            return "not_installed"
+
+        monkeypatch.setattr(_mod, "_reconcile_ods_managed_pixel_model", reconcile)
+        return targets
+
+    @staticmethod
+    def _route_capabilities(install_dir):
+        state = json.loads((install_dir / "data" / "model-state.json").read_text(encoding="utf-8"))
+        return state["active"]["capabilities"]
+
+    def test_enabled_profile_sets_the_route_capabilities(self, tmp_path, monkeypatch):
+        install_dir = self._profiled_fixture(tmp_path, mode="enabled")
+
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, self._runtime())
+
+        assert handler.response_code == 200, handler.parse_response()
+        assert self._route_capabilities(install_dir) == {
+            "chat": True, "tools": True, "vision": False, "agentViable": True}
+
+    def test_enabled_failed_tool_check_marks_the_route_not_agent_viable(self, tmp_path, monkeypatch):
+        install_dir = self._profiled_fixture(tmp_path, mode="enabled")
+        no_call = self._runtime(tool=lambda scripted: scripted._completion("I cannot use tools."))
+
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, no_call)
+
+        assert handler.response_code == 200
+        assert handler.parse_response()["profile"]["summary"]["tools"] is False
+        assert self._route_capabilities(install_dir) == {
+            "chat": True, "tools": False, "vision": False, "agentViable": False}
+
+    def test_a_verified_catalog_model_stays_agent_viable_through_a_failed_tool_check(self, tmp_path, monkeypatch):
+        # The catalog also claims tools; the measured failure must win for "tools".
+        verified = {"tools": True, "app_compatibility": {"agent_viability": {"status": "verified"}}}
+        install_dir = self._profiled_fixture(tmp_path, mode="enabled", entry=verified)
+        no_call = self._runtime(tool=lambda scripted: scripted._completion("I cannot use tools."))
+
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, no_call)
+
+        assert handler.response_code == 200
+        assert self._route_capabilities(install_dir) == {
+            "chat": True, "tools": False, "vision": False, "agentViable": True}
+
+    def test_observe_writes_the_same_route_and_consumer_files_as_off(self, tmp_path, monkeypatch):
+        written = {}
+        for mode in ("off", "observe"):
+            install_dir = self._profiled_fixture(tmp_path / mode, mode=mode)
+            targets = self._pixel_targets(monkeypatch)
+            no_call = self._runtime(tool=lambda scripted: scripted._completion("I cannot use tools."))
+            handler, _order, _phases = self._activate(install_dir, monkeypatch, no_call)
+            assert handler.response_code == 200
+            def text(rel, install_dir=install_dir):
+                return (install_dir / rel).read_text(encoding="utf-8").replace(str(install_dir), "<install>")
+
+            files = {
+                rel: text(rel)
+                for rel in ("config/litellm/local.yaml", "config/llama-server/models.ini",
+                            "config/model-router/endpoints.json", "data/hermes/config.yaml")
+                if (install_dir / rel).exists()
+            }
+            written[mode] = (self._route_capabilities(install_dir), targets, files,
+                             text(".env").replace(f"ODS_MODEL_PROFILES={mode}", ""))
+        assert written["observe"] == written["off"]
+        assert written["off"][0] == {"chat": True, "tools": False, "vision": False, "agentViable": True}
+
+    def test_enabled_pixel_reasoning_follows_the_measured_thinking_control(self, tmp_path, monkeypatch):
+        # Reasoning is configured on, but the template has no thinking at all.
+        plain = {**self.PROPS, "chat_template": "{% if tools %}<tools>{% endif %}{{ messages }}"}
+        install_dir = self._profiled_fixture(tmp_path / "none", mode="enabled", env_extra="LLAMA_REASONING=on\n")
+        targets = self._pixel_targets(monkeypatch)
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, self._runtime(props=plain))
+        assert handler.response_code == 200
+        assert targets[-1]["reasoning"] is False
+
+        # Reasoning is configured off, but the model always thinks.
+        always = {**self.PROPS, "chat_template": "{% if tools %}<tools>{% endif %}<think>{{ messages }}"}
+        install_dir = self._profiled_fixture(tmp_path / "always", mode="enabled", env_extra="LLAMA_REASONING=off\n")
+        targets = self._pixel_targets(monkeypatch)
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, self._runtime(props=always))
+        assert handler.response_code == 200
+        assert handler.parse_response()["profile"]["summary"]["thinking"]["control"] == "always"
+        assert targets[-1]["reasoning"] is True
+
+    @pytest.mark.parametrize("vision_answer, expected", [("Red", "supported"), ("Blue", "unsupported")])
+    def test_enabled_pixel_image_input_follows_the_vision_check(self, tmp_path, monkeypatch, vision_answer, expected):
+        with_projector = {**self.PROPS, "modalities": {"vision": True, "audio": False}}
+        install_dir = self._profiled_fixture(tmp_path, mode="enabled")
+        targets = self._pixel_targets(monkeypatch)
+        runtime = self._runtime(props=with_projector, vision=lambda scripted: scripted._completion(vision_answer))
+
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, runtime)
+
+        assert handler.response_code == 200
+        assert targets[-1]["image_input"] == expected
+        assert self._route_capabilities(install_dir)["vision"] is (expected == "supported")
+
+    def test_enabled_without_a_projector_keeps_todays_image_input(self, tmp_path, monkeypatch):
+        install_dir = self._profiled_fixture(tmp_path, mode="enabled")
+        targets = self._pixel_targets(monkeypatch)
+
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, self._runtime())
+
+        assert handler.response_code == 200
+        assert targets[-1]["image_input"] == "unknown"
+
+
+class TestProfileTraits:
+    """WP4 helpers: what a profile summary tells consumers, and only when enabled."""
+
+    SUMMARY = {"chat": True, "tools": True, "toolsStreamed": True, "vision": None, "tokensPerSecond": 9.0,
+               "thinking": {"control": "always", "separated": True, "works": True}}
+
+    @pytest.mark.parametrize("mode, status, expected", [
+        ("enabled", "recorded", {"tools": True, "vision": None, "control": "always"}),
+        ("enabled", "cached", {"tools": True, "vision": None, "control": "always"}),
+        ("enabled", "error", None),
+        ("enabled", "skipped", None),
+        ("observe", "recorded", None),
+        ("off", "recorded", None),
+    ])
+    def test_traits_exist_only_for_an_enabled_recorded_or_reused_profile(self, mode, status, expected):
+        traits = _mod._profile_traits({"ODS_MODEL_PROFILES": mode}, {"status": status, "summary": self.SUMMARY})
+        assert traits == expected
+
+    def test_a_think_tag_without_working_thinking_counts_as_none(self):
+        summary = {**self.SUMMARY, "thinking": {"control": "always", "separated": None, "works": False}}
+        assert _mod._summary_traits(summary)["control"] == "none"
+        assert _mod._summary_traits({"thinking": {"control": "bogus"}})["control"] is None
+        assert _mod._summary_traits(None) == {"tools": None, "vision": None, "control": None}
+
+    @pytest.mark.parametrize("tools, verified, expected", [
+        (True, False, {"chat": True, "tools": True, "vision": True, "agentViable": True}),
+        (False, False, {"chat": True, "tools": False, "vision": True, "agentViable": False}),
+        (False, True, {"chat": True, "tools": False, "vision": True, "agentViable": True}),
+    ])
+    def test_capability_projection(self, tools, verified, expected):
+        today = {"chat": True, "tools": False, "vision": False, "agentViable": True}
+        model = {"app_compatibility": {"pixel_agent": {"status": "verified"}}} if verified else {}
+        traits = {"tools": tools, "vision": True, "control": "enable_thinking"}
+        assert _mod._profiled_capabilities(today, traits, model) == expected
+
+    def test_an_unknown_tools_result_or_no_traits_changes_nothing(self):
+        today = {"chat": True, "tools": False, "vision": False, "agentViable": True}
+        assert _mod._profiled_capabilities(today, None, {}) is today
+        unknown = {"tools": None, "vision": True, "control": "none"}
+        assert _mod._profiled_capabilities(today, unknown, {}) is today
+
+    def test_a_context_too_small_for_agents_stays_not_agent_viable(self):
+        today = {"chat": True, "tools": False, "vision": False, "agentViable": False}
+        traits = {"tools": True, "vision": None, "control": None}
+        assert _mod._profiled_capabilities(today, traits, {})["agentViable"] is False
+
+    @pytest.mark.parametrize("control, configured, expected", [
+        ("always", False, True), ("none", True, False),
+        ("enable_thinking", True, True), ("enable_thinking", False, False), (None, True, True),
+    ])
+    def test_pixel_reasoning(self, control, configured, expected):
+        traits = {"tools": True, "vision": None, "control": control}
+        assert _mod._profiled_pixel_reasoning(configured, traits) is expected
+        assert _mod._profiled_pixel_reasoning(configured, None) is configured
+
+    def test_pixel_image_input(self):
+        assert _mod._profiled_pixel_image_input("unknown", {"vision": True}) == "supported"
+        assert _mod._profiled_pixel_image_input("supported", {"vision": False}) == "unsupported"
+        assert _mod._profiled_pixel_image_input("unknown", {"vision": None}) == "unknown"
+        assert _mod._profiled_pixel_image_input("supported", None) == "supported"
+
 
 class TestVisionProjectorActivation:
     """WP2: a vision import loads its projector in the container; any other model clears it."""

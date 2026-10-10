@@ -5970,6 +5970,71 @@ class TestModelActivationOwnership:
         _mod._project_switchboard_agent_viability(payload)
         assert "activeRuntime" not in payload and "activeAgentViable" not in payload
 
+    def _profiled_install(self, tmp_path, monkeypatch, *, mode, last_model="same-model", summary=None):
+        install_dir = tmp_path / "ods"
+        install_dir.mkdir()
+        (install_dir / ".env").write_text(
+            "ODS_MODE=local\nGPU_BACKEND=cpu\nLLM_MODEL=same-model\nGGUF_FILE=same-model.gguf\n"
+            f"CTX_SIZE=65536\nODS_MODEL_PROFILES={mode}\n",
+            encoding="utf-8",
+        )
+        _mod._switchboard_state.record_verified_route(
+            install_dir / "data" / "model-state.json", catalog_id="same-model",
+            runtime_model_id="same-model.gguf", backend_kind="llama-server",
+            endpoint_id="llama-server-default", context_length=65536,
+            capabilities={"chat": True, "tools": True, "vision": False, "agentViable": True},
+            proof_identity="same-model.gguf",
+        )
+        if summary is not None:
+            store = _mod._model_profile_store
+            key = store.profile_key(
+                gguf_sha256=["a" * 64], projector_sha256=None, build_info="b11429-x", backend="cpu",
+                template_sha256="b" * 64, template_source="embedded", suite="3", host="host",
+            )
+            profile = store.recorded_profile(key, model_id=last_model, gguf_file="same-model.gguf",
+                                             result={"probes": {}, "summary": summary, "elapsedMs": 1},
+                                             product_version="test")
+            doc = store.with_last_activation(store.with_profile(store.empty(), profile),
+                                             last_model, profile["keyHash"])
+            store.atomic_write(install_dir / "data" / "model-profiles.json", doc)
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_active_remote_provider_pixel_runtime", lambda **_: None)
+        return install_dir
+
+    SUMMARY = {"chat": True, "tools": False, "toolsStreamed": False, "vision": None, "tokensPerSecond": 50.0,
+               "thinking": {"control": "always", "separated": True, "works": True}}
+
+    def test_model_status_reports_the_active_profile_only_when_enabled(self, tmp_path, monkeypatch):
+        # Any-model WP4.3: Portal and Talk advisories read the active model's profile.
+        self._profiled_install(tmp_path, monkeypatch, mode="enabled", summary=self.SUMMARY)
+        payload = {"status": "idle"}
+        _mod._project_switchboard_agent_viability(payload)
+        assert payload["activeModelProfile"] == {"state": "measured", "tools": False, "thinkingControl": "always"}
+
+    @pytest.mark.parametrize("mode", ["observe", "off"])
+    def test_model_status_is_unchanged_without_enabled_profiles(self, tmp_path, monkeypatch, mode):
+        self._profiled_install(tmp_path, monkeypatch, mode=mode, summary=self.SUMMARY)
+        payload = {"status": "idle"}
+        _mod._project_switchboard_agent_viability(payload)
+        assert "activeModelProfile" not in payload
+        assert payload["activeAgentViable"] is True
+
+    @pytest.mark.parametrize("last_model, summary", [("other-model", SUMMARY), ("same-model", None)])
+    def test_a_model_without_its_own_profile_is_reported_not_profiled(
+        self, tmp_path, monkeypatch, last_model, summary,
+    ):
+        self._profiled_install(tmp_path, monkeypatch, mode="enabled", last_model=last_model, summary=summary)
+        payload = {}
+        _mod._project_switchboard_agent_viability(payload)
+        assert payload["activeModelProfile"] == {"state": "not-profiled", "tools": None, "thinkingControl": None}
+
+    def test_an_unreadable_profile_store_reads_as_not_profiled(self, tmp_path, monkeypatch):
+        install_dir = self._profiled_install(tmp_path, monkeypatch, mode="enabled", summary=self.SUMMARY)
+        (install_dir / "data" / "model-profiles.json").write_text("{not json", encoding="utf-8")
+        payload = {}
+        _mod._project_switchboard_agent_viability(payload)
+        assert payload["activeModelProfile"]["state"] == "not-profiled"
+
     def test_non_activation_lock_owner_reports_unknown_target(self, monkeypatch):
         monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
         handler = _FakeHandler(json.dumps({"model_id": "target-a"}).encode("utf-8"))

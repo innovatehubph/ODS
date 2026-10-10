@@ -2534,6 +2534,53 @@ def _start_pixel_sharing_change(action, body, route):
         raise
 
 
+# (file mtime_ns, size) -> store document; one tuple, replaced whole, so
+# concurrent status handlers never pair one file's key with another's content.
+_ACTIVE_PROFILE_CACHE: list[tuple[tuple[int, int], dict | None]] = []
+
+
+def _model_profile_doc_cached() -> dict | None:
+    """The profile store, re-read only when the file changes (status is polled)."""
+    path = _model_profile_path()
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    key = (info.st_mtime_ns, info.st_size)
+    cached = _ACTIVE_PROFILE_CACHE[0] if _ACTIVE_PROFILE_CACHE else None
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        doc = _model_profile_store.load(path)
+    except (_model_profile_store.StoreError, OSError, UnicodeError):
+        logger.warning("Model profile store unreadable for status; reporting not profiled")
+        doc = None
+    _ACTIVE_PROFILE_CACHE[:] = [(key, doc)]
+    return doc
+
+
+def _active_model_profile(env: dict, catalog_id: object) -> dict | None:
+    """What the active model's profile says, for the Portal and Talk advisories.
+
+    Only in ``enabled`` mode. The profile is the one this model's last switch
+    recorded or reused; a model switched to before profiling existed is
+    reported as not profiled. "Check again" updates it without a switch.
+    """
+    if (_model_profiles_mode(env) != "enabled" or _model_profile_store is None
+            or not isinstance(catalog_id, str) or not catalog_id):
+        return None
+    doc = _model_profile_doc_cached()
+    last = (doc or {}).get("lastActivation") or {}
+    profile = None
+    if last.get("modelId") == catalog_id:
+        profile = next((entry for entry in reversed(doc["profiles"])
+                        if entry.get("keyHash") == last.get("keyHash")), None)
+    if profile is None:
+        return {"state": "not-profiled", "tools": None, "thinkingControl": None}
+    traits = _summary_traits((profile.get("result") or {}).get("summary"))
+    return {"state": "measured", "tools": traits["tools"], "thinkingControl": traits["control"]}
+
+
 def _project_switchboard_agent_viability(payload: dict) -> None:
     """Project the verified active route's identity and Pixel viability.
 
@@ -2590,6 +2637,9 @@ def _project_switchboard_agent_viability(payload: dict) -> None:
             "model": local_model,
             "contextLength": local_context,
         }
+    active_profile = _active_model_profile(env, active.get("catalogId"))
+    if active_profile is not None:
+        payload["activeModelProfile"] = active_profile
     capabilities = active.get("capabilities")
     if not isinstance(capabilities, dict):
         return
@@ -3517,6 +3567,30 @@ def _pixel_model_reasoning_capable(model: str, env: dict[str, str]) -> bool:
     """Project ODS's runtime reasoning contract into Pixel model metadata."""
     configured = str(env.get("LLAMA_REASONING") or "").strip().lower()
     return configured not in {"", "off", "none", "false", "0"}
+
+
+def _profiled_pixel_reasoning(configured: bool, traits: dict | None) -> bool:
+    """Pixel's reasoning flag; a measured thinking control decides it (WP4.2, enabled only).
+
+    A model that cannot turn thinking off reasons whatever ODS asks, and one
+    without thinking never does; otherwise the configured runtime rule stands.
+    """
+    control = (traits or {}).get("control")
+    if control == "always":
+        return True
+    if control == "none":
+        return False
+    return configured
+
+
+def _profiled_pixel_image_input(configured: str, traits: dict | None) -> str:
+    """Pixel's image input from the vision probe when a projector was loaded (WP4.2)."""
+    vision = (traits or {}).get("vision")
+    if vision is True:
+        return "supported"
+    if vision is False:
+        return "unsupported"
+    return configured
 
 
 def _pixel_max_tokens_for_context(context_length: int) -> int:
@@ -14062,6 +14136,8 @@ class AgentHandler(BaseHTTPRequestHandler):
         gpu_assignment_plan: dict | None = None
         previous_pixel_context: int | None = None
         previous_pixel_image_input = "unknown"
+        previous_pixel_contract: dict[str, object] | None = None
+        profile_traits: dict | None = None
         router_target_published = False
         previous_router_active = {}
         wsl_changed_digest = None
@@ -14294,6 +14370,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                         previous_model,
                         rollback_env,
                     )
+                    # With profiles enabled the previous model's reasoning
+                    # came from its profile; restore what was in effect.
+                    captured_reasoning = (previous_pixel_contract or {}).get("reasoning")
+                    if (_model_profiles_mode(rollback_env) == "enabled"
+                            and isinstance(captured_reasoning, bool)):
+                        previous_reasoning = captured_reasoning
                     restored_pixel = _reconcile_ods_managed_pixel_model(
                         previous_hermes_model,
                         previous_pixel_context,
@@ -14808,6 +14890,12 @@ class AgentHandler(BaseHTTPRequestHandler):
                 # is touched (first switch per file x build x host only).
                 model_profile_status = _profile_model_advisory(
                     env, model, model_id=model_id, gguf_file=gguf_file)
+                # WP4 (enabled only): the measured traits replace the catalog
+                # booleans for every reader of this switch's route record.
+                profile_traits = _profile_traits(env, model_profile_status)
+                if switchboard_run is not None and profile_traits is not None:
+                    switchboard_run["capabilities"] = _profiled_capabilities(
+                        switchboard_run.get("capabilities"), profile_traits, model)
                 _set_model_activation_phase('verifying')
                 if host_native_llama:
                     _write_host_native_litellm_config(env, gguf_file, llm_model_name)
@@ -14996,8 +15084,10 @@ class AgentHandler(BaseHTTPRequestHandler):
                     'model': pixel_runtime_identity,
                     'contextLength': int(context_length),
                     'maxTokens': _pixel_max_tokens_for_context(int(context_length)),
-                    'reasoning': _pixel_model_reasoning_capable(str(llm_model_name), env),
-                    'imageInput': _pixel_model_image_input(model_id),
+                    'reasoning': _profiled_pixel_reasoning(
+                        _pixel_model_reasoning_capable(str(llm_model_name), env), profile_traits),
+                    'imageInput': _profiled_pixel_image_input(
+                        _pixel_model_image_input(model_id), profile_traits),
                 }
                 pixel_status = (pixel_transaction.apply(pixel_target) if pixel_transaction is not None
                     else _reconcile_ods_managed_pixel_model(
@@ -15642,6 +15732,71 @@ def _profile_model_advisory(env: dict, model: dict, *, model_id: str, gguf_file:
     except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
         logger.exception("Model profile for %s did not complete", model_id)
         return {"status": "error", "reason": type(exc).__name__}
+
+
+_THINKING_CONTROLS = frozenset({"enable_thinking", "always", "none"})
+
+
+def _summary_traits(summary: object) -> dict:
+    """The measured answers consumers read from a profile summary (WP4).
+
+    ``None`` means not known. The static template rule calls any template that
+    mentions ``<think>`` "always"; when the thinking probe found no working
+    reasoning, the model is treated as having none.
+    """
+    summary = summary if isinstance(summary, dict) else {}
+    thinking = summary.get("thinking") if isinstance(summary.get("thinking"), dict) else {}
+    control = thinking.get("control") if thinking.get("control") in _THINKING_CONTROLS else None
+    if control == "always" and thinking.get("works") is False:
+        control = "none"
+    tools, vision = summary.get("tools"), summary.get("vision")
+    return {
+        "tools": tools if isinstance(tools, bool) else None,
+        "vision": vision if isinstance(vision, bool) else None,
+        "control": control,
+    }
+
+
+def _profile_traits(env: dict, profile_status: object) -> dict | None:
+    """This switch's measured traits, or None: consumers then keep today's values.
+
+    Only ``ODS_MODEL_PROFILES=enabled`` lets a profile change what consumers
+    are told (PLAN D5), and only a profile this switch recorded or reused.
+    """
+    if _model_profiles_mode(env) != "enabled" or not isinstance(profile_status, dict):
+        return None
+    if profile_status.get("status") not in {"recorded", "cached"}:
+        return None
+    return _summary_traits(profile_status.get("summary"))
+
+
+def _catalog_agent_verified(model: object) -> bool:
+    """Whether the curated catalog records this model as verified for agents."""
+    compatibility = model.get("app_compatibility") if isinstance(model, dict) else None
+    if not isinstance(compatibility, dict):
+        return False
+    return any(
+        isinstance(compatibility.get(key), dict) and compatibility[key].get("status") == "verified"
+        for key in ("agent_viability", "pixel_agent")
+    )
+
+
+def _profiled_capabilities(capabilities: object, traits: dict | None, model: dict) -> object:
+    """Switchboard capabilities with the measured profile applied (WP4.1).
+
+    An unknown tools result changes nothing. A catalog ``verified`` agent
+    verdict keeps a curated model agent-viable through one failed probe run,
+    so a flaky probe cannot break a curated default (batch C decision 1).
+    """
+    if traits is None or traits["tools"] is None or not isinstance(capabilities, dict):
+        return capabilities
+    return {
+        **capabilities,
+        "tools": traits["tools"],
+        "vision": traits["vision"] is True,
+        "agentViable": capabilities.get("agentViable") is True
+        and (traits["tools"] or _catalog_agent_verified(model)),
+    }
 
 
 def _runtime_health(env: dict) -> str:
