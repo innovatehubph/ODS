@@ -2559,25 +2559,33 @@ def _model_profile_doc_cached() -> dict | None:
     return doc
 
 
-def _active_model_profile(env: dict, catalog_id: object) -> dict | None:
-    """What the active model's profile says, for the Portal and Talk advisories.
+def _stored_profile_traits(catalog_id: object) -> dict | None:
+    """Traits of the profile this model's last switch recorded or reused, if any.
 
-    Only in ``enabled`` mode. The profile is the one this model's last switch
-    recorded or reused; a model switched to before profiling existed is
-    reported as not profiled. "Check again" updates it without a switch.
+    A model switched to before profiling existed has none; "Check again"
+    replaces it without a switch.
     """
-    if (_model_profiles_mode(env) != "enabled" or _model_profile_store is None
-            or not isinstance(catalog_id, str) or not catalog_id):
+    if _model_profile_store is None or not isinstance(catalog_id, str) or not catalog_id:
         return None
     doc = _model_profile_doc_cached()
     last = (doc or {}).get("lastActivation") or {}
-    profile = None
-    if last.get("modelId") == catalog_id:
-        profile = next((entry for entry in reversed(doc["profiles"])
-                        if entry.get("keyHash") == last.get("keyHash")), None)
+    if last.get("modelId") != catalog_id:
+        return None
+    profile = next((entry for entry in reversed(doc["profiles"])
+                    if entry.get("keyHash") == last.get("keyHash")), None)
     if profile is None:
+        return None
+    return _summary_traits((profile.get("result") or {}).get("summary"))
+
+
+def _active_model_profile(env: dict, catalog_id: object) -> dict | None:
+    """What the active model's profile says, for the Portal and Talk advisories (enabled only)."""
+    if (_model_profiles_mode(env) != "enabled" or _model_profile_store is None
+            or not isinstance(catalog_id, str) or not catalog_id):
+        return None
+    traits = _stored_profile_traits(catalog_id)
+    if traits is None:
         return {"state": "not-profiled", "tools": None, "thinkingControl": None}
-    traits = _summary_traits((profile.get("result") or {}).get("summary"))
     return {"state": "measured", "tools": traits["tools"], "thinkingControl": traits["control"]}
 
 
@@ -2896,6 +2904,11 @@ def _publish_verified_initial_switchboard_route(
         "vision": bool(model.get("vision")),
         "agentViable": _model_agent_viable(model, context_length),
     }
+    if _model_profiles_mode(env) == "enabled":
+        # After an install or upgrade, re-publish what the model's last switch
+        # measured instead of the catalog booleans (WP4.1).
+        capabilities = _profiled_capabilities(
+            capabilities, _stored_profile_traits(model_id or llm_model_name or gguf_file), model)
     # A model transition can begin while the slow runtime proof is in flight.
     # Serialize the final write with lifecycle admission and recheck the
     # durable journal: a held transaction's before-state must stay immutable
