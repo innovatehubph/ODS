@@ -7948,6 +7948,35 @@ class TestModelProfileInActivation:
         assert handler.response_code == 200
         assert handler.parse_response()["profile"]["summary"]["thinking"]["control"] == "always"
         assert targets[-1]["reasoning"] is True
+        # C4: the measured control reaches Pixel's answers through the reconcile.
+        assert targets[-1]["thinking_control"] == "always"
+
+    def test_observe_sends_no_thinking_control_to_pixel(self, tmp_path, monkeypatch):
+        always = {**self.PROPS, "chat_template": "{% if tools %}<tools>{% endif %}<think>{{ messages }}"}
+        install_dir = self._profiled_fixture(tmp_path, mode="observe")
+        targets = self._pixel_targets(monkeypatch)
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, self._runtime(props=always))
+        assert handler.response_code == 200
+        assert "thinking_control" not in targets[-1]
+
+    def test_a_failed_switch_restores_the_previous_models_thinking_control(self, tmp_path, monkeypatch):
+        install_dir = self._profiled_fixture(tmp_path, mode="enabled")
+        calls = []
+
+        def reconcile(model, context_length, **kwargs):
+            calls.append((model, kwargs.get("thinking_control")))
+            if model == "new-model.gguf":
+                raise RuntimeError("simulated Pixel reconciliation failure")
+            return "reconciled"
+
+        monkeypatch.setattr(_mod, "_reconcile_ods_managed_pixel_model", reconcile)
+        monkeypatch.setattr(_mod, "_managed_pixel_thinking_control", lambda: "none")
+        always = {**self.PROPS, "chat_template": "{% if tools %}<tools>{% endif %}<think>{{ messages }}"}
+
+        handler, _order, _phases = self._activate(install_dir, monkeypatch, self._runtime(props=always))
+
+        assert handler.response_code == 500 and handler.parse_response()["rolled_back"] is True
+        assert calls == [("new-model.gguf", "always"), ("old-model.gguf", "none")]
 
     @pytest.mark.parametrize("vision_answer, expected", [("Red", "supported"), ("Blue", "unsupported")])
     def test_enabled_pixel_image_input_follows_the_vision_check(self, tmp_path, monkeypatch, vision_answer, expected):
@@ -8097,3 +8126,40 @@ class TestVisionProjectorActivation:
         assert handler.response_code == 400
         assert "verification" in handler.parse_response()["error"]
         assert env_path.read_text(encoding="utf-8") == before
+
+
+class TestManagedPixelThinkingControl:
+    """C4: the control saved in the ODS-managed Pixel answers, read before a rollback."""
+
+    def _answers(self, tmp_path, monkeypatch, payload, *, env="", identity=True):
+        install = tmp_path / "install"
+        (install / "data" / "pixel").mkdir(parents=True)
+        (install / ".env").write_text(env, encoding="utf-8")
+        if payload is not None:
+            (install / "data" / "pixel" / "onboarding.json").write_text(payload, encoding="utf-8")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install)
+        monkeypatch.setattr(_mod, "_ods_managed_pixel_identity",
+                            lambda: ("pixel-owner", tmp_path / "home") if identity else None)
+
+    @pytest.mark.parametrize("payload, expected", [
+        (json.dumps({"modelId": "m", "modelThinkingControl": "always"}), "always"),
+        (json.dumps({"modelId": "m", "modelThinkingControl": "none"}), "none"),
+        (json.dumps({"modelId": "m"}), None),
+        (json.dumps({"modelId": "m", "modelThinkingControl": "sometimes"}), None),
+        ("{not json", None),
+        (None, None),
+    ])
+    def test_reads_only_a_valid_saved_control(self, tmp_path, monkeypatch, payload, expected):
+        self._answers(tmp_path, monkeypatch, payload)
+        assert _mod._managed_pixel_thinking_control() == expected
+
+    def test_coordinator_and_unmanaged_installs_carry_none(self, tmp_path, monkeypatch):
+        saved = json.dumps({"modelThinkingControl": "always"})
+        self._answers(tmp_path, monkeypatch, saved, env="PIXEL_OPENWEBUI_KEY=set\n")
+        assert _mod._managed_pixel_thinking_control() is None
+        self._answers(tmp_path / "other", monkeypatch, saved, identity=False)
+        assert _mod._managed_pixel_thinking_control() is None
+
+    def test_thinking_control_kwargs_are_omitted_without_a_control(self):
+        assert _mod._thinking_control_kwargs(None) == {}
+        assert _mod._thinking_control_kwargs("always") == {"thinking_control": "always"}
