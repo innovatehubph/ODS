@@ -7698,7 +7698,7 @@ class TestModelProfileInActivation:
 
         return exchange
 
-    def _activate(self, install_dir, monkeypatch, exchange):
+    def _activate(self, install_dir, monkeypatch, exchange, model_id="target-model"):
         order: list[str] = []
         phases: list[str] = []
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
@@ -7712,7 +7712,7 @@ class TestModelProfileInActivation:
 
         monkeypatch.setattr(_mod, "_render_model_router_runtime_configs", render)
         handler = _ResponseHandler()
-        _mod.AgentHandler._do_model_activate(handler, "target-model")
+        _mod.AgentHandler._do_model_activate(handler, model_id)
         return handler, order, phases
 
     def test_first_switch_profiles_before_consumers_then_reuses_the_profile(self, tmp_path, monkeypatch):
@@ -7800,11 +7800,19 @@ class TestModelProfileInActivation:
 
         return factory
 
-    def _profiled_fixture(self, tmp_path, *, mode, entry=None, env_extra=""):
+    def _profiled_fixture(self, tmp_path, *, mode, entry=None, env_extra="", imported=False):
         install_dir, env_path, *_ = _write_model_activation_fixture(tmp_path)
         library = install_dir / "config" / "model-library.json"
         document = json.loads(library.read_text(encoding="utf-8"))
         document["models"][0].update({"context_length": 65536, **(entry or {})})
+        if imported:
+            # The same file as a Hugging Face import instead of a curated entry.
+            record = {**document["models"][0], "id": "hf-target-model", "source": "huggingface",
+                      "gguf_url": "https://huggingface.co/org/repo/resolve/" + "a" * 40 + "/new-model.gguf",
+                      "size_bytes": len(b"model")}
+            (install_dir / "data" / "model-imports.json").write_text(
+                json.dumps({"version": 1, "models": [record]}), encoding="utf-8")
+            document["models"][0].update({"id": "other-model", "gguf_file": "other-model.gguf"})
         library.write_text(json.dumps(document), encoding="utf-8")
         env_path.write_text(env_path.read_text(encoding="utf-8").replace("CTX_SIZE=2048", "CTX_SIZE=65536")
                             + f"ODS_MODEL_PROFILES={mode}\n{env_extra}", encoding="utf-8")
@@ -7857,13 +7865,15 @@ class TestModelProfileInActivation:
         assert self._route_capabilities(install_dir) == {
             "chat": True, "tools": False, "vision": False, "agentViable": True}
 
-    def test_observe_writes_the_same_route_and_consumer_files_as_off(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("imported", [False, True], ids=["curated", "import"])
+    def test_observe_writes_the_same_route_and_consumer_files_as_off(self, tmp_path, monkeypatch, imported):
         written = {}
+        model_id = "hf-target-model" if imported else "target-model"
         for mode in ("off", "observe"):
-            install_dir = self._profiled_fixture(tmp_path / mode, mode=mode)
+            install_dir = self._profiled_fixture(tmp_path / mode, mode=mode, imported=imported)
             targets = self._pixel_targets(monkeypatch)
             no_call = self._runtime(tool=lambda scripted: scripted._completion("I cannot use tools."))
-            handler, _order, _phases = self._activate(install_dir, monkeypatch, no_call)
+            handler, _order, _phases = self._activate(install_dir, monkeypatch, no_call, model_id=model_id)
             assert handler.response_code == 200
             def text(rel, install_dir=install_dir):
                 return (install_dir / rel).read_text(encoding="utf-8").replace(str(install_dir), "<install>")
