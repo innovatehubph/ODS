@@ -2452,14 +2452,13 @@ check _ods_pixel_candidate_is_managed_runtime_update "$owner" "$reconcile_home" 
 for thinking_control in enable_thinking always none; do
     control_answers="$TEST_ROOT/thinking-$thinking_control-onboarding.json"
     control_candidate="$TEST_ROOT/thinking-$thinking_control-candidate.json"
-    python3 - "$reconcile_answers" "$control_answers" "$thinking_control" <<'PY'
-import json, pathlib, sys
-value = json.loads(pathlib.Path(sys.argv[1]).read_text())
-value["modelThinkingControl"] = sys.argv[3]
-pathlib.Path(sys.argv[2]).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-PY
+    cp "$reconcile_answers" "$control_answers"
     cp "$reconcile_candidate" "$control_candidate"
     chmod 0600 "$control_answers" "$control_candidate"
+    check _ods_pixel_update_onboarding_model "$owner" "$reconcile_home" "$control_answers" \
+        qwen-new 65536 2048 true "" unknown "$thinking_control"
+    check python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["modelThinkingControl"] == sys.argv[2]' \
+        "$control_answers" "$thinking_control"
     export ODS_TEST_THINKING_CONTROL="$thinking_control"
     check test -n "$(_ods_pixel_apply_runtime_budget "$owner" "$reconcile_home" "$control_candidate" "$runtime_validator" "$control_answers")"
     unset ODS_TEST_THINKING_CONTROL
@@ -2487,6 +2486,17 @@ PY
         fi
     fi
 done
+# A model promoted without a measured control never keeps an earlier one.
+check _ods_pixel_update_onboarding_model "$owner" "$reconcile_home" "$control_answers" qwen-new 65536 2048 true
+check python3 -c 'import json,sys; assert "modelThinkingControl" not in json.load(open(sys.argv[1]))' "$control_answers"
+cp "$control_answers" "$TEST_ROOT/thinking-before-invalid.json"
+if _ods_pixel_update_onboarding_model "$owner" "$reconcile_home" "$control_answers" \
+    qwen-new 65536 2048 true "" unknown sometimes >/dev/null 2>&1; then
+    fail "invalid promoted Pixel thinking control rejected"
+else
+    pass "invalid promoted Pixel thinking control rejected"
+fi
+check cmp -s "$control_answers" "$TEST_ROOT/thinking-before-invalid.json"
 cp "$reconcile_config" "$TEST_ROOT/reconcile-config-with-control-bind.json"
 python3 - "$reconcile_config" <<'PY'
 import json, pathlib, sys

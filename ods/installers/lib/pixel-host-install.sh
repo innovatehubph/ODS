@@ -882,19 +882,23 @@ PY
 _ods_pixel_stable_alias_matches_promoted_model() {
     local owner="$1" home="$2" answers="$3" promoted_model="$4"
     local promoted_context="${5:-}" promoted_max_tokens="${6:-}" promoted_reasoning="${7:-}" config
-    local route_fingerprint="${8:-}" image_input="${9:-unknown}"
+    local route_fingerprint="${8:-}" image_input="${9:-unknown}" thinking_control="${10:-}"
     config="$home/.openclaw/openclaw.json"
     ods_pixel_run_as_owner "$owner" "$home" python3 - \
         "$answers" "$config" "$promoted_model" "$promoted_context" \
-        "$promoted_max_tokens" "$promoted_reasoning" "$route_fingerprint" "$image_input" <<'PY'
+        "$promoted_max_tokens" "$promoted_reasoning" "$route_fingerprint" "$image_input" \
+        "$thinking_control" <<'PY'
 import json, os, pathlib, re, stat, sys
 
 answers_path, config_path = map(pathlib.Path, sys.argv[1:3])
 promoted_model, context_raw, max_tokens_raw, reasoning_raw = sys.argv[3:7]
 route_fingerprint = sys.argv[7] or None
 image_input = sys.argv[8]
+thinking_control = sys.argv[9] or None
 if image_input not in ("supported", "unsupported", "unknown"):
     raise SystemExit("invalid promoted Pixel image-input contract")
+if thinking_control not in (None, "enable_thinking", "always", "none"):
+    raise SystemExit("invalid promoted Pixel thinking-control contract")
 if route_fingerprint is not None and not re.fullmatch(r"[a-f0-9]{64}", route_fingerprint):
     raise SystemExit(1)
 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:/ @(),=-]{0,255}", promoted_model):
@@ -920,6 +924,9 @@ if (answers.get("modelImageInput", "unknown") != image_input
     raise SystemExit(1)
 if (answers.get("modelRouteFingerprint") != route_fingerprint
         or config.get("plugins", {}).get("entries", {}).get("pixel-ods", {}).get("config", {}).get("modelRouteFingerprint") != route_fingerprint):
+    raise SystemExit(1)
+# The config never names the control; the answers that rendered it do.
+if answers.get("modelThinkingControl") != thinking_control:
     raise SystemExit(1)
 if answers.get("modelProvider") != "ods-gateway" or answers.get("modelId") != "ods/current":
     raise SystemExit(1)
@@ -1280,6 +1287,12 @@ if (type(context_window) is not int or type(max_tokens) is not int or type(reaso
         or not 4096 <= context_window <= 10_000_000
         or not 1 <= max_tokens <= context_window):
     raise SystemExit("live Pixel model limits are outside the ODS model-only contract")
+# The rollback contract describes the live model. A measured thinking control
+# saved for another model (the answers can lag a native switch) is dropped.
+if contract.get("modelThinkingControl") not in (None, "enable_thinking", "always", "none"):
+    raise SystemExit("invalid Pixel thinking-control contract")
+if (contract.get("modelProvider"), contract.get("modelId"), contract.get("modelName")) != (provider, model_id, model_name):
+    contract.pop("modelThinkingControl", None)
 contract["modelProvider"] = provider
 contract["modelId"] = models[0]["id"]
 contract["modelName"] = models[0]["name"]
@@ -1318,9 +1331,10 @@ PY
 _ods_pixel_update_onboarding_model() {
     local owner="$1" home="$2" answers="$3" model="$4"
     local context="${5:-}" max_tokens="${6:-}" reasoning="${7:-}"
-    local route_fingerprint="${8:-}" image_input="${9:-unknown}"
+    local route_fingerprint="${8:-}" image_input="${9:-unknown}" thinking_control="${10:-}"
     ods_pixel_run_as_owner "$owner" "$home" python3 - \
-        "$answers" "$model" "$context" "$max_tokens" "$reasoning" "$route_fingerprint" "$image_input" <<'PY'
+        "$answers" "$model" "$context" "$max_tokens" "$reasoning" "$route_fingerprint" "$image_input" \
+        "$thinking_control" <<'PY'
 import json, os, pathlib, re, stat, sys, tempfile
 
 path = pathlib.Path(sys.argv[1])
@@ -1328,8 +1342,11 @@ model = sys.argv[2]
 context_raw, max_tokens_raw, reasoning_raw = sys.argv[3:6]
 route_fingerprint = sys.argv[6] or None
 image_input = sys.argv[7]
+thinking_control = sys.argv[8] or None
 if image_input not in ("supported", "unsupported", "unknown"):
     raise SystemExit("invalid promoted Pixel image-input contract")
+if thinking_control not in (None, "enable_thinking", "always", "none"):
+    raise SystemExit("invalid promoted Pixel thinking-control contract")
 if route_fingerprint is not None and not re.fullmatch(r"[a-f0-9]{64}", route_fingerprint):
     raise SystemExit("invalid promoted Pixel route identity")
 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+:/ @(),=-]{0,255}", model):
@@ -1424,6 +1441,11 @@ if provider == "ods-gateway" and route_fingerprint is not None:
     value["modelRouteFingerprint"] = route_fingerprint
 else:
     value.pop("modelRouteFingerprint", None)
+# The promoted model's own control or none: never another model's.
+if thinking_control is None:
+    value.pop("modelThinkingControl", None)
+else:
+    value["modelThinkingControl"] = thinking_control
 payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
 fd, temporary = tempfile.mkstemp(prefix=".pixel-onboarding.", dir=path.parent)
 try:
@@ -2526,11 +2548,14 @@ ods_pixel_reconcile_promoted_model() {
     local owner="$1" home="$2" promoted_model="$3" final_state="${4:-ready}"
     local promoted_context="${5:-}" promoted_max_tokens="${6:-}" promoted_reasoning="${7:-}"
     local route_fingerprint="${8:-}" borrowed_transaction="${9:-}" image_input="${10:-unknown}"
+    # A measured thinking control for this model; empty keeps the name rule.
+    local thinking_control="${11:-}"
     local source_ref source_root source_url pixel_root answers candidate backup contract_sha256 openclaw_bin failed=false
     local model_transaction="" release_failed=false
     local stable_alias=false staged_alias_candidate=""
     local failure_phase="unknown"
     [[ "$final_state" == ready || "$final_state" == installing ]] || return 1
+    [[ -z "$thinking_control" || "$thinking_control" =~ ^(enable_thinking|always|none)$ ]] || return 1
     if [[ -n "$borrowed_transaction" ]]; then
         [[ "$borrowed_transaction" =~ ^[0-9a-f]{64}$ ]] || return 1
         local held_status
@@ -2559,7 +2584,7 @@ ods_pixel_reconcile_promoted_model() {
     if _ods_pixel_uses_stable_model_alias "$owner" "$home" "$answers"; then
         if _ods_pixel_stable_alias_matches_promoted_model "$owner" "$home" "$answers" \
             "$promoted_model" "$promoted_context" "$promoted_max_tokens" \
-            "$promoted_reasoning" "$route_fingerprint" "$image_input"; then
+            "$promoted_reasoning" "$route_fingerprint" "$image_input" "$thinking_control"; then
             contract_sha256="$(_ods_pixel_contract_sha256 "$owner" "$home" "$answers")" || return 1
             # This is a no-op model reconciliation only when the complete
             # ODS-managed contract is already active. A same-model installer
@@ -2603,7 +2628,8 @@ ods_pixel_reconcile_promoted_model() {
     fi
 
     if ! _ods_pixel_update_onboarding_model "$owner" "$home" "$answers" "$promoted_model" \
-        "$promoted_context" "$promoted_max_tokens" "$promoted_reasoning" "$route_fingerprint" "$image_input"; then
+        "$promoted_context" "$promoted_max_tokens" "$promoted_reasoning" "$route_fingerprint" "$image_input" \
+        "$thinking_control"; then
         failed=true
         failure_phase="onboarding-update"
     fi
@@ -5596,7 +5622,8 @@ ods_pixel_install_default_agent() {
                 if ! ods_pixel_reconcile_promoted_model "$owner" "$home" \
                     "$(_ods_pixel_runtime_model_identity)" installing "" "" "" \
                     "$(jq -r '.modelRouteFingerprint // ""' "$answers")" "${ODS_PIXEL_SOURCE_TRANSACTION:-}" \
-                    "$(jq -r '.modelImageInput // "unknown"' "$answers")" >>"$pixel_log" 2>&1; then
+                    "$(jq -r '.modelImageInput // "unknown"' "$answers")" \
+                    "$(jq -r '.modelThinkingControl // ""' "$answers")" >>"$pixel_log" 2>&1; then
                     ai_bad "The ODS-managed Pixel model route could not be reconciled safely. See $pixel_log."
                     return 1
                 fi

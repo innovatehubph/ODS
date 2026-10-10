@@ -3651,8 +3651,13 @@ def _reconcile_ods_managed_pixel_model(
     reasoning: bool = False,
     route_fingerprint: str | None = None,
     image_input: str | None = None,
+    thinking_control: str | None = None,
 ) -> str:
-    """Transactionally bind the managed Pixel gateway to an activated model."""
+    """Transactionally bind the managed Pixel gateway to an activated model.
+
+    ``thinking_control`` is the model's measured control. None keeps the
+    renderer's name rule and clears a control saved for an earlier model.
+    """
     identity = _ods_managed_pixel_identity()
     if identity is None:
         return "not_installed"
@@ -3660,6 +3665,8 @@ def _reconcile_ods_managed_pixel_model(
         raise RuntimeError("The promoted Pixel model identity is invalid")
     if image_input is not None and image_input not in ("supported", "unsupported", "unknown"):
         raise RuntimeError("The promoted Pixel image-input policy is invalid")
+    if thinking_control is not None and thinking_control not in ("enable_thinking", "always", "none"):
+        raise RuntimeError("The promoted Pixel thinking control is invalid")
     if not isinstance(context_length, int) or isinstance(context_length, bool) \
             or not 4096 <= context_length <= 10_000_000:
         raise RuntimeError("Pixel requires a model context between 4096 and 10000000 tokens")
@@ -3709,6 +3716,7 @@ target_max_tokens="$6"
 target_reasoning="$7"
 target_route_fingerprint="$8"
 target_image_input="$9"
+target_thinking_control="${10}"
 INTERACTIVE=false
 DRY_RUN=false
 log() { printf '%s\n' "$*" >&2; }
@@ -3727,7 +3735,8 @@ export INSTALL_DIR INTERACTIVE DRY_RUN ODS_SUDO_AVAILABLE
 . "$INSTALL_DIR/installers/lib/sudo.sh"
 . "$INSTALL_DIR/installers/lib/pixel-host-install.sh"
 ods_pixel_reconcile_promoted_model "$owner" "$home" "$target_model" ready \
-    "$target_context" "$target_max_tokens" "$target_reasoning" "$target_route_fingerprint" "" "$target_image_input"
+    "$target_context" "$target_max_tokens" "$target_reasoning" "$target_route_fingerprint" "" "$target_image_input" \
+    "$target_thinking_control"
 '''
     child_env = {
         "HOME": str(home),
@@ -3748,6 +3757,7 @@ ods_pixel_reconcile_promoted_model "$owner" "$home" "$target_model" ready \
                 "true" if reasoning else "false",
                 route_fingerprint or "",
                 image_input or "unknown",
+                thinking_control or "",
             ],
             env=child_env,
             capture_output=True,

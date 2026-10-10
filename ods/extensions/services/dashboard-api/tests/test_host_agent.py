@@ -4712,10 +4712,10 @@ class TestRemoteProviderLifecycle:
         monkeypatch.setattr(_mod.subprocess, "run", fake_run)
         runtime = {"model": "same-model", "contextLength": 32768, "maxTokens": 4096, "reasoning": False}
         assert _mod._reconcile_managed_pixel_contract({**runtime, "routeFingerprint": "a" * 64}) == "reconciled"
-        assert calls[-1][-2:] == ["a" * 64, "unknown"]
+        assert calls[-1][-3:] == ["a" * 64, "unknown", ""]
         assert 'target_route_fingerprint="$8"' in calls[-1][2]
         assert _mod._reconcile_managed_pixel_contract(runtime) == "reconciled"
-        assert calls[-1][-2:] == ["", "unknown"]
+        assert calls[-1][-3:] == ["", "unknown", ""]
         with pytest.raises(RuntimeError, match="route identity"):
             _mod._reconcile_managed_pixel_contract({**runtime, "routeFingerprint": "a" * 64 + "\n"})
         assert len(calls) == 2

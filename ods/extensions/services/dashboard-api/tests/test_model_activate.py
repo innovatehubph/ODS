@@ -3614,7 +3614,9 @@ def test_managed_pixel_reconcile_uses_positional_args_and_minimal_environment(
         max_tokens=4096,
         reasoning=True,
     ) == "reconciled"
-    assert captured["argv"][-9:] == [
+    # No measured thinking control: an explicit empty argument, which the
+    # installer reads as "keep the name rule".
+    assert captured["argv"][-10:] == [
         str(install_dir),
         "pixel-owner",
         str(home),
@@ -3624,12 +3626,52 @@ def test_managed_pixel_reconcile_uses_positional_args_and_minimal_environment(
         "true",
         "",
         "unknown",
+        "",
     ]
     assert captured["kwargs"]["timeout"] == 900
     assert captured["kwargs"]["check"] is False
     assert captured["kwargs"]["env"]["PIXEL_SOURCE_URL"] == "bundled"
     assert captured["kwargs"]["env"]["PIXEL_GATEWAY_PORT"] == expected_gateway_port
     assert "UNRELATED_SECRET" not in captured["kwargs"]["env"]
+
+
+@pytest.mark.parametrize("control", ["enable_thinking", "always", "none"])
+def test_managed_pixel_reconcile_passes_measured_thinking_control(tmp_path, monkeypatch, control):
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    (install_dir / ".env").write_text("PIXEL_SOURCE_URL=bundled\n", encoding="utf-8")
+    captured = {}
+
+    def fake_run(argv, **_kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="reconciled\n", stderr="")
+
+    monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+    monkeypatch.setattr(_mod, "_ods_managed_pixel_identity", lambda: ("pixel-owner", tmp_path / "home"))
+    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+    assert _mod._reconcile_ods_managed_pixel_model(
+        "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf", 65536, thinking_control=control,
+    ) == "reconciled"
+    assert captured["argv"][-2:] == ["unknown", control]
+    script = captured["argv"][2]
+    assert 'target_thinking_control="${10}"' in script
+    assert script.rstrip().endswith('"$target_image_input" \\\n    "$target_thinking_control"')
+
+
+@pytest.mark.parametrize("control", ["", "sometimes", "ALWAYS", True])
+def test_managed_pixel_reconcile_rejects_invalid_thinking_control_before_subprocess(
+    tmp_path, monkeypatch, control,
+):
+    monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(_mod, "_ods_managed_pixel_identity", lambda: ("pixel-owner", tmp_path / "home"))
+    monkeypatch.setattr(
+        _mod.subprocess, "run",
+        lambda *_args, **_kwargs: pytest.fail("an invalid thinking control must fail before subprocess"),
+    )
+
+    with pytest.raises(RuntimeError, match="thinking control is invalid"):
+        _mod._reconcile_ods_managed_pixel_model("safe-model", 65536, thinking_control=control)
 
 
 @pytest.mark.parametrize("explicit_source", [True, False])
