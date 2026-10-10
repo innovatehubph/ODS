@@ -301,3 +301,37 @@ def test_validate_catalog_runs_the_check_on_template_changes():
     for path in ("ods/config/chat-templates/**", "ods/scripts/validate-chat-templates.py",
                  "ods/scripts/vendor-chat-templates.py", "ods/bin/model_profile/templates.py"):
         assert workflow.count(f"'{path}'") == 2, path
+
+
+# --- native macOS restarts (scripts/resolve-model-store.py) ---------------------
+
+resolver = _load_script("resolve-model-store")
+
+
+def _install_with_template(tmp_path, override):
+    install = tmp_path / "install"
+    (install / "config").mkdir(parents=True)
+    _tree(install / "config")
+    env = "GGUF_FILE=model.gguf\n" + (f"MODEL_CHAT_TEMPLATE_OVERRIDE={override}\n" if override else "")
+    (install / ".env").write_text(env, encoding="utf-8")
+    return install
+
+
+def test_a_restart_gets_the_fixed_template_the_switch_chose(tmp_path):
+    install = _install_with_template(tmp_path, "fake-tools-fix")
+    path = Path(resolver.chat_template_path(install))
+    assert path == install / "config" / "chat-templates" / "upstream-b9014" / "Fake-Model.jinja"
+
+
+def test_a_restart_without_an_override_uses_the_models_own_template(tmp_path):
+    assert resolver.chat_template_path(_install_with_template(tmp_path, None)) is None
+
+
+def test_a_missing_or_altered_fixed_template_refuses_the_restart(tmp_path):
+    install = _install_with_template(tmp_path, "no-such-fix")
+    with pytest.raises(ValueError, match="not in this installation"):
+        resolver.chat_template_path(install)
+    install = _install_with_template(tmp_path / "altered", "fake-tools-fix")
+    (install / "config" / "chat-templates" / "upstream-b9014" / "Fake-Model.jinja").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="SHA-256"):
+        resolver.chat_template_path(install)
