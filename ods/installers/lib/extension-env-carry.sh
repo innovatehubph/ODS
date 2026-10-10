@@ -90,7 +90,9 @@ ods_carry_public_url_env_keys() {
 # Settings ODS tells the owner to put in .env that no installer writes: the
 # dashboard's n8n API key (routers/workflows.py), the Hugging Face token for
 # gated downloads (routers/models.py), the Intel Arc image override
-# (docker-compose.arc.yml) and Open WebUI's speech settings (tts/README.md).
+# (docker-compose.arc.yml), Open WebUI's speech settings (tts/README.md) and
+# whether apps use measured model profiles (ODS_MODEL_PROFILES,
+# docs/MODEL-MANAGEMENT.md).
 # Installer-managed keys must not be listed: an old value would override the
 # installer's new choice.
 # shellcheck disable=SC2034  # read by installers/phases/06-directories.sh
@@ -103,6 +105,7 @@ ODS_OWNER_ENV_KEYS=(
     AUDIO_TTS_VOICE
     AUDIO_TTS_OPENAI_API_BASE_URL
     AUDIO_TTS_OPENAI_API_KEY
+    ODS_MODEL_PROFILES
 )
 
 # Append to NEW_ENV each named KEY that NEW_ENV lacks and PREVIOUS_ENV has,

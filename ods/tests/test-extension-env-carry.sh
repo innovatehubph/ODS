@@ -203,12 +203,14 @@ N8N_API_KEY=n8n-api-current
 HF_TOKEN='hf_owner token'
 LLAMA_ARC_IMAGE=ghcr.io/example/arc@sha256:abc
 AUDIO_TTS_VOICE=af_bella
+ODS_MODEL_PROFILES=enabled
 HF_TOKEN_EXTRA=not-listed
 LLAMA_ARG_N_CPU_MOE=99
 ENV
 printf 'WEBUI_SECRET=current\nAUDIO_TTS_VOICE=from-template\n' > "$tmp/owner-new.env"
 ods_carry_named_env_keys "$tmp/owner-old.env" "$tmp/owner-new.env" "${ODS_OWNER_ENV_KEYS[@]}"
-for line in N8N_API_KEY=n8n-api-current "HF_TOKEN='hf_owner token'" LLAMA_ARC_IMAGE=ghcr.io/example/arc@sha256:abc; do
+for line in N8N_API_KEY=n8n-api-current "HF_TOKEN='hf_owner token'" LLAMA_ARC_IMAGE=ghcr.io/example/arc@sha256:abc \
+        ODS_MODEL_PROFILES=enabled; do
     if [[ "$(grep -cxF "$line" "$tmp/owner-new.env")" == 1 ]]; then
         pass "owner setting carried: ${line%%=*}"
     else
