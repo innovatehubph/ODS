@@ -29,6 +29,7 @@ from pixel_runtime_state import begin_pixel_stream, end_pixel_stream, try_begin_
 from pixel_chat_results import ChatResultStore, ResultCapacity, ResultConflict, owner_namespace
 from security import verify_api_key
 from config import read_live_env_value
+from context_policy import PIXEL_MIN_CONTEXT
 from helpers import get_loaded_model, get_llama_context_size
 from pixel_chat_identity import messages_with_identity
 from pixel_chat_context import HistoryMessage, HistorySnapshot, public_context
@@ -75,6 +76,24 @@ _MODEL_CAPABILITY_DETAIL = (
     "The active model is recorded as not agent-qualified. Tool-driven tasks "
     "may be unreliable; chat and experiments remain available."
 )
+# Measured-profile advisories (WP4.3). The dashboard shows its own copy per
+# reason; this text serves API readers and older dashboards.
+_MODEL_SUPPORT_REASONS = {
+    "context-too-small": (
+        f"The active model runs with less than {PIXEL_MIN_CONTEXT // 1024}K tokens of context, "
+        "too small for Portal tasks. Load it with more context in Models, or switch models."
+    ),
+    "tools-unavailable": (
+        "The active model did not complete a tool call when ODS checked it. "
+        "Tool-driven tasks may fail; chat still works."
+    ),
+    "not-profiled": (
+        "ODS has not checked what the active model can do. Use Check again in Models."
+    ),
+    "thinking-always-on": (
+        "The active model always thinks before it answers, so replies take longer."
+    ),
+}
 
 
 def _validate_edge_url(raw: str) -> str:
@@ -429,13 +448,40 @@ def _model_readiness_issue_from_status(status: object) -> tuple[str, str] | None
     return None
 
 
+def _profile_support_reason(profile: dict, status: dict) -> str | None:
+    """The most important measured advisory for the active model, if any.
+
+    A context below Portal's floor breaks every task, so it comes first; then
+    a failed tool check, a model never checked, and one that always thinks.
+    """
+    runtime = _active_runtime_projection(status)
+    context = runtime.get("contextLength") if isinstance(runtime, dict) else None
+    if (runtime or {}).get("source") == "local-switchboard" and type(context) is int \
+            and 0 < context < PIXEL_MIN_CONTEXT:
+        return "context-too-small"
+    if profile.get("tools") is False:
+        return "tools-unavailable"
+    if profile.get("state") == "not-profiled":
+        return "not-profiled"
+    if profile.get("thinkingControl") == "always":
+        return "thinking-always-on"
+    return None
+
+
 def _model_support_from_status(status: object) -> dict[str, str] | None:
     """Return fixed advisory metadata without turning model quality into access.
 
     ODS model qualification is a recommendation signal. Pixel's brokers,
     approvals, and typed capabilities enforce safety independently of model
     intelligence, so an unqualified model remains usable and testable.
+    With ``ODS_MODEL_PROFILES=enabled`` the host reports the active model's
+    measured profile and the advisory names its reason; it never blocks a send.
     """
+    profile = status.get("activeModelProfile") if isinstance(status, dict) else None
+    if isinstance(profile, dict):
+        reason = _profile_support_reason(profile, status)
+        if reason is not None:
+            return {"tier": "adaptive", "detail": _MODEL_SUPPORT_REASONS[reason], "reason": reason}
     if isinstance(status, dict) and status.get("activeAgentViable") is False:
         # Keep the legacy wire value for rolling UI upgrades. It denotes an
         # advisory, not evidence that the runtime adapts or the model can act.

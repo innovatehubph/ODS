@@ -738,6 +738,55 @@ async def test_status_keeps_adaptive_model_available_with_fixed_advisory(monkeyp
     assert "adapt" not in result["modelSupport"]["detail"]
 
 
+_LOCAL_64K = {"source": "local-switchboard", "model": "model.gguf", "contextLength": 65536}
+
+
+@pytest.mark.parametrize("profile, runtime, viable, reason", [
+    # Any-model WP4.3: the measured profile names the advisory; the order is
+    # context, tools, not profiled, always thinking.
+    ({"state": "measured", "tools": False, "thinkingControl": "always"},
+     {**_LOCAL_64K, "contextLength": 8192}, False, "context-too-small"),
+    ({"state": "measured", "tools": False, "thinkingControl": "always"}, _LOCAL_64K, False, "tools-unavailable"),
+    ({"state": "not-profiled", "tools": None, "thinkingControl": None}, _LOCAL_64K, True, "not-profiled"),
+    ({"state": "measured", "tools": True, "thinkingControl": "always"}, _LOCAL_64K, True, "thinking-always-on"),
+])
+def test_profile_advisory_names_its_reason(profile, runtime, viable, reason):
+    status = {"activeModelProfile": profile, "activeRuntime": runtime, "activeAgentViable": viable}
+    support = pixel._model_support_from_status(status)
+    assert support == {"tier": "adaptive", "detail": pixel._MODEL_SUPPORT_REASONS[reason], "reason": reason}
+
+
+def test_a_measured_capable_model_gets_no_advisory():
+    profile = {"state": "measured", "tools": True, "thinkingControl": "enable_thinking"}
+    status = {"activeModelProfile": profile, "activeRuntime": _LOCAL_64K, "activeAgentViable": True}
+    assert pixel._model_support_from_status(status) is None
+    # Without a profile (observe, off) the advisory is today's.
+    assert pixel._model_support_from_status({"activeAgentViable": False}) == {
+        "tier": "adaptive", "detail": pixel._MODEL_CAPABILITY_DETAIL}
+
+
+def test_context_advisory_needs_a_local_route():
+    profile = {"state": "measured", "tools": True, "thinkingControl": "none"}
+    remote = {"source": "remote-provider", "model": "m", "contextLength": 8192, "maxTokens": 1024,
+              "reasoning": False}
+    assert pixel._model_support_from_status({"activeModelProfile": profile, "activeRuntime": remote}) is None
+
+
+@pytest.mark.asyncio
+async def test_a_profile_advisory_never_blocks_a_send(monkeypatch):
+    async def measured(*_args, **_kwargs):
+        return {"status": "idle", "activeAgentViable": False, "activeRuntime": _LOCAL_64K,
+                "activeModelProfile": {"state": "measured", "tools": False, "thinkingControl": "none"}}
+
+    monkeypatch.setattr(pixel, "request_agent_json", measured)
+    body = json.dumps({"data": [{"id": "portal/default"}]}).encode()
+    with patch.object(pixel.httpx, "AsyncClient", return_value=FakeClient(FakeResponse(chunks=[body]))):
+        result = await pixel.pixel_status()
+    assert result["available"] is True
+    assert result["modelSupport"]["reason"] == "tools-unavailable"
+    assert await pixel._model_readiness_issue() is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("viability", [True, None, "false", 0, "unknown"])
 async def test_status_does_not_infer_failed_qualification_from_unknown_or_qualified_metadata(monkeypatch, viability):
